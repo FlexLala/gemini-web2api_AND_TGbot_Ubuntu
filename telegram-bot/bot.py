@@ -1074,6 +1074,10 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e:
             logger.error(f"Inline PM fallback failed: {e}")
 
+async def callback_ai_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Заглушка для кнопки ожидания в inline-сообщении."""
+    await update.callback_query.answer("Ответ ещё генерируется…", cache_time=1)
+
 async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запускаем обработку в фоне, чтобы не блокировать бота."""
     import asyncio
