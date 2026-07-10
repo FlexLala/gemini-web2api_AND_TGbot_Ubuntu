@@ -6,7 +6,7 @@ services:
     container_name: gemini-web2api
     working_dir: /app
     volumes:
-      - ./gemini-web2api:/app:ro
+      - ./gemini-web2api:/app
       - ./config.json:/app/config.json:ro
     command: >
       sh -c "pip install -q --no-cache-dir httpx &&
