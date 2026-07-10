@@ -1000,13 +1000,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _process_text(update, context, prompt, doc_text=doc_text)
 
 async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
-    """Быстрый запрос для inline с коротким таймаутом."""
+    """Быстрый запрос для inline с таймаутом."""
     payload = {
         "model": INLINE_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
     }
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=90.0) as client:
         resp = await client.post(GEMINI_API_URL, json=payload, headers=HEADERS)
         resp.raise_for_status()
         data = resp.json()
@@ -1019,48 +1019,8 @@ async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
     usage = data.get("usage", {})
     return {"text": answer, "model": INLINE_MODEL, "usage": usage}
 
-# ─── Inline mode (placeholder + keyboard → chosen_inline_result) ───────────
-
-WAIT_KEYBOARD = InlineKeyboardMarkup([
-    [InlineKeyboardButton(text="⏳ Ответ генерируется…", callback_data="ai_wait")]
-])
-
-async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.inline_query.query
-    user = update.effective_user
-    if not user or not query or len(query.strip()) < 2:
-        return
-
-    ensure_user(user.id, user.username, user.first_name, allowed=1 if user.id == ADMIN_ID else 0)
-
-    if user.id != ADMIN_ID:
-        u = get_user(user.id)
-        if not u or not u["allowed"] or u["blocked"]:
-            if not is_ignored(user.id):
-                await notify_admin_request(update, context)
-            return
-
-    title = query.strip()[:50] + "..." if len(query.strip()) > 50 else query.strip()
-    results = [
-        InlineQueryResultArticle(
-            id="gemini_inline",
-            title=title,
-            input_message_content=InputTextMessageContent(
-                f"⏳ <b>Запрос:</b> {html.escape(query.strip()[:200])}\n\n<i>Обрабатываю…</i>",
-                parse_mode=ParseMode.HTML,
-            ),
-            reply_markup=WAIT_KEYBOARD,
-            description="Нажмите, чтобы отправить запрос",
-        )
-    ]
-    await update.inline_query.answer(results, cache_time=0, is_personal=True)
-
-async def callback_ai_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Заглушка для кнопки ожидания."""
-    await update.callback_query.answer("Ответ ещё генерируется…", cache_time=1)
-
-async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Только здесь делаем 1 запрос к Gemini."""
+async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка выбранного inline-результата в фоне."""
     chosen = update.chosen_inline_result
     if not chosen or chosen.result_id != "gemini_inline":
         return
@@ -1069,7 +1029,7 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = chosen.from_user.id
     inline_message_id = chosen.inline_message_id
 
-    logger.info(f"chosen_inline_result: user={user_id}, query={query_text[:50]!r}, msg_id={inline_message_id}")
+    logger.info(f"Inline chosen: user={user_id}, query={query_text[:50]!r}, msg_id={inline_message_id}")
 
     if user_id != ADMIN_ID:
         u = get_user(user_id)
@@ -1084,11 +1044,14 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
         full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}"
         usage = result.get("usage", {})
         update_stats(user_id, usage.get("prompt_tokens", 0) * 4, usage.get("completion_tokens", 0) * 4)
+    except httpx.ReadTimeout:
+        logger.error("Inline: Gemini timeout")
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка: таймаут. Gemini слишком долго думает. Попробуйте позже."
     except httpx.HTTPStatusError as e:
-        full_text = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка API: <code>{e.response.status_code}</code>"
     except Exception as e:
         logger.exception("Inline Gemini error")
-        full_text = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка: <code>{html.escape(str(e))}</code>"
 
     if inline_message_id:
         try:
@@ -1110,6 +1073,11 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         except Exception as e:
             logger.error(f"Inline PM fallback failed: {e}")
+
+async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запускаем обработку в фоне, чтобы не блокировать бота."""
+    import asyncio
+    asyncio.create_task(_process_inline_chosen(update, context))
 
 # ─── Admin commands ──────────────────────────────────────────────────────────
 
