@@ -1383,7 +1383,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     init_db()
-    application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
     # commands
     application.add_handler(CommandHandler("start", cmd_start))
@@ -1418,3 +1418,17 @@ def main() -> None:
 
     # messages
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # errors
+    application.add_error_handler(error_handler)
+
+    # backup job at 04:00
+    application.job_queue.run_daily(backup_job, time=time(hour=4, minute=0))
+
+    logger.info("Бот запущен. Ожидаю сообщения...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
