@@ -1016,7 +1016,8 @@ async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
 
     choice = data.get("choices", [{}])[0]
     answer = choice.get("message", {}).get("content") or "(пустой ответ)"
-    return {"text": answer, "model": INLINE_MODEL}
+    usage = data.get("usage", {})
+    return {"text": answer, "model": INLINE_MODEL, "usage": usage}
 
 # ─── Inline mode (placeholder + keyboard → chosen_inline_result) ───────────
 
@@ -1081,6 +1082,8 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
         if len(formatted) > 4000:
             formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
         full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}"
+        usage = result.get("usage", {})
+        update_stats(user_id, usage.get("prompt_tokens", 0) * 4, usage.get("completion_tokens", 0) * 4)
     except httpx.HTTPStatusError as e:
         full_text = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
     except Exception as e:
