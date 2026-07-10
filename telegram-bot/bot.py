@@ -20,7 +20,7 @@ import logging
 import shutil
 import base64
 import io
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Optional, List, Dict, Any
 
 import httpx
@@ -1030,7 +1030,27 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]
     await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
-async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
+    """Быстрый запрос для inline с коротким таймаутом."""
+    payload = {
+        "model": INLINE_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(GEMINI_API_URL, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", "Unknown API error"))
+
+    choice = data.get("choices", [{}])[0]
+    answer = choice.get("message", {}).get("content") or "(пустой ответ)"
+    return {"text": answer, "model": INLINE_MODEL}
+
+async def _process_inline_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка inline-результата в отдельной задаче, чтобы не блокировать бота."""
     chosen = update.chosen_inline_result
     if not chosen or chosen.result_id != "gemini_inline":
         return
@@ -1047,13 +1067,14 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
             return
 
     try:
-        result = await ask_gemini(user_id, query_text, INLINE_MODEL, dialog_id=None)
+        result = await ask_gemini_inline(user_id, query_text)
         formatted = format_gemini_text(result["text"])
         if len(formatted) > 4000:
             formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
     except httpx.HTTPStatusError as e:
         formatted = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
     except Exception as e:
+        logger.error(f"Inline processing error: {e}")
         formatted = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
 
     try:
@@ -1064,6 +1085,11 @@ async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYP
         )
     except Exception as e:
         logger.error(f"Edit inline message failed: {e}")
+
+async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Запускаем обработку в фоне, чтобы не блокировать другие апдейты."""
+    import asyncio
+    asyncio.create_task(_process_inline_task(update, context))
 
 # ─── Admin commands ──────────────────────────────────────────────────────────
 
@@ -1217,7 +1243,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     init_db()
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     # commands
     application.add_handler(CommandHandler("start", cmd_start))
@@ -1254,7 +1280,7 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     # backup job at 04:00
-    application.job_queue.run_daily(backup_job, time=datetime.time(hour=4, minute=0))
+    application.job_queue.run_daily(backup_job, time=time(hour=4, minute=0))
 
     logger.info("Бот запущен. Ожидаю сообщения...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
