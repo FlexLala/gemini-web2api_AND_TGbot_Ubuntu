@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  gemini-api:
+    image: python:3.11-slim
+    container_name: gemini-web2api
+    working_dir: /app
+    volumes:
+      - ./gemini-web2api:/app:ro
+      - ./config.json:/app/config.json:ro
+    command: >
+      sh -c "pip install -q --no-cache-dir httpx &&
+             python gemini_web2api.py --config config.json"
+    networks:
+      - gemini-bot-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  telegram-bot:
+    build: ./telegram-bot
+    container_name: gemini-telegram-bot
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    networks:
+      - gemini-bot-net
+    restart: unless-stopped
+    depends_on:
+      gemini-api:
+        condition: service_healthy
+
+networks:
+  gemini-bot-net:
+    driver: bridge
