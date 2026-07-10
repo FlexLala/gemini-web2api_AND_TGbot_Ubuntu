@@ -1062,10 +1062,6 @@ async def _process_inline_task(update: Update, context: ContextTypes.DEFAULT_TYP
 
         logger.info(f"Inline task started: user={user_id}, query={query_text[:50]!r}, msg_id={inline_message_id}")
 
-        if not inline_message_id:
-            logger.error("Inline task: no inline_message_id")
-            return
-
         if user_id != ADMIN_ID:
             u = get_user(user_id)
             if not u or not u["allowed"] or u["blocked"]:
@@ -1085,15 +1081,30 @@ async def _process_inline_task(update: Update, context: ContextTypes.DEFAULT_TYP
             logger.exception("Inline task Gemini error")
             formatted = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
 
-        try:
-            await context.bot.edit_message_text(
-                text=f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}",
-                inline_message_id=inline_message_id,
-                parse_mode=ParseMode.HTML,
-            )
-            logger.info("Inline task: message edited successfully")
-        except Exception as e:
-            logger.error(f"Inline task edit_message_text failed: {e}")
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}"
+
+        if inline_message_id:
+            # Редактируем отправленное inline-сообщение
+            try:
+                await context.bot.edit_message_text(
+                    text=full_text,
+                    inline_message_id=inline_message_id,
+                    parse_mode=ParseMode.HTML,
+                )
+                logger.info("Inline task: message edited successfully")
+            except Exception as e:
+                logger.error(f"Inline task edit_message_text failed: {e}")
+        else:
+            # Нет inline_message_id — шлём личное сообщение пользователю
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"📨 <b>Ответ на инлайн-запрос:</b>\n\n{full_text}",
+                    parse_mode=ParseMode.HTML,
+                )
+                logger.info("Inline task: sent PM to user")
+            except Exception as e:
+                logger.error(f"Inline task send_message failed: {e}")
     except Exception as e:
         logger.exception(f"Inline task unexpected error: {e}")
 
