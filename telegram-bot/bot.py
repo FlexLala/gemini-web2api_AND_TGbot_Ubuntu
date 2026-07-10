@@ -1018,7 +1018,11 @@ async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
     answer = choice.get("message", {}).get("content") or "(пустой ответ)"
     return {"text": answer, "model": INLINE_MODEL}
 
-# ─── Inline mode (immediate result) ──────────────────────────────────────────
+# ─── Inline mode (placeholder + keyboard → chosen_inline_result) ───────────
+
+WAIT_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton(text="⏳ Ответ генерируется…", callback_data="ai_wait")]
+])
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.inline_query.query
@@ -1035,35 +1039,74 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await notify_admin_request(update, context)
             return
 
-    # Делаем запрос к Gemini прямо здесь — результат сразу в чате
-    try:
-        result = await ask_gemini_inline(user.id, query.strip())
-        formatted = format_gemini_text(result["text"])
-        if len(formatted) > 4000:
-            formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
-    except httpx.HTTPStatusError as e:
-        formatted = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
-    except Exception as e:
-        logger.error(f"Inline query error: {e}")
-        formatted = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
-
     title = query.strip()[:50] + "..." if len(query.strip()) > 50 else query.strip()
     results = [
         InlineQueryResultArticle(
             id="gemini_inline",
             title=title,
             input_message_content=InputTextMessageContent(
-                f"<b>Вопрос:</b> {html.escape(query.strip()[:200])}\n\n{formatted}",
+                f"⏳ <b>Запрос:</b> {html.escape(query.strip()[:200])}\n\n<i>Обрабатываю…</i>",
                 parse_mode=ParseMode.HTML,
             ),
-            description="Нажмите, чтобы отправить ответ Gemini",
+            reply_markup=WAIT_KEYBOARD,
+            description="Нажмите, чтобы отправить запрос",
         )
     ]
     await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
+async def callback_ai_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Заглушка для кнопки ожидания."""
+    await update.callback_query.answer("Ответ ещё генерируется…", cache_time=1)
+
 async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Больше не нужен — результат уже вставлен. Оставляем пустым."""
-    pass
+    """Только здесь делаем 1 запрос к Gemini."""
+    chosen = update.chosen_inline_result
+    if not chosen or chosen.result_id != "gemini_inline":
+        return
+
+    query_text = chosen.query.strip()
+    user_id = chosen.from_user.id
+    inline_message_id = chosen.inline_message_id
+
+    logger.info(f"chosen_inline_result: user={user_id}, query={query_text[:50]!r}, msg_id={inline_message_id}")
+
+    if user_id != ADMIN_ID:
+        u = get_user(user_id)
+        if not u or not u["allowed"] or u["blocked"]:
+            return
+
+    try:
+        result = await ask_gemini_inline(user_id, query_text)
+        formatted = format_gemini_text(result["text"])
+        if len(formatted) > 4000:
+            formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}"
+    except httpx.HTTPStatusError as e:
+        full_text = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
+    except Exception as e:
+        logger.exception("Inline Gemini error")
+        full_text = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
+
+    if inline_message_id:
+        try:
+            await context.bot.edit_message_text(
+                text=full_text,
+                inline_message_id=inline_message_id,
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+            logger.info("Inline: message edited successfully")
+        except Exception as e:
+            logger.error(f"Inline edit failed: {e}")
+    else:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"📨 <b>Ответ на инлайн-запрос:</b>\n\n{full_text}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as e:
+            logger.error(f"Inline PM fallback failed: {e}")
 
 # ─── Admin commands ──────────────────────────────────────────────────────────
 
@@ -1240,6 +1283,7 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(callback_switch, pattern=r"^switch:"))
     application.add_handler(CallbackQueryHandler(callback_admin, pattern=r"^(allow|ignore):"))
     application.add_handler(CallbackQueryHandler(callback_actions, pattern=r"^(rephrase|continue|delete):"))
+    application.add_handler(CallbackQueryHandler(callback_ai_wait, pattern=r"^ai_wait$"))
 
     # inline
     application.add_handler(InlineQueryHandler(inline_query))
