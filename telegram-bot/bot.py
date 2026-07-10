@@ -20,7 +20,8 @@ import logging
 import shutil
 import base64
 import io
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time as dt_time
+import time as _time_module
 from typing import Optional, List, Dict, Any
 
 import httpx
@@ -421,7 +422,7 @@ def check_rate_limit(user_id: int) -> tuple:
     msgs = int(get_setting("rate_limit_messages", "5"))
     window = int(get_setting("rate_limit_window", "60"))
     ignore_dur = int(get_setting("rate_limit_ignore", "600"))
-    now = time.time()
+    now = _time_module.time()
     conn = _conn()
     c = conn.cursor()
     c.execute("DELETE FROM rate_limit_log WHERE timestamp < ?", (now - window,))
@@ -443,17 +444,17 @@ _ignore_cache: Dict[int, float] = {}
 
 def is_ignored(user_id: int) -> bool:
     ts = _ignore_cache.get(user_id, 0)
-    if time.time() - ts < IGNORE_TTL_SEC:
+    if _time_module.time() - ts < IGNORE_TTL_SEC:
         return True
     if user_id in _ignore_cache:
         del _ignore_cache[user_id]
     return False
 
 def add_ignore(user_id: int) -> None:
-    _ignore_cache[user_id] = time.time()
+    _ignore_cache[user_id] = _time_module.time()
 
 def add_ignore_custom(user_id: int, seconds: int) -> None:
-    _ignore_cache[user_id] = time.time() + seconds - IGNORE_TTL_SEC
+    _ignore_cache[user_id] = _time_module.time() + seconds - IGNORE_TTL_SEC
 
 # ─── LaTeX / HTML formatting ─────────────────────────────────────────────────
 
@@ -1425,7 +1426,7 @@ def main() -> None:
     application.add_error_handler(error_handler)
 
     # backup job at 04:00
-    application.job_queue.run_daily(backup_job, time=time(hour=4, minute=0))
+    application.job_queue.run_daily(backup_job, time=dt_time(hour=4, minute=0))
 
     logger.info("Бот запущен. Ожидаю сообщения...")
     application.run_polling()
