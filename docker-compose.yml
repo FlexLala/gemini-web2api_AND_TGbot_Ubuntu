@@ -14,12 +14,6 @@ services:
     networks:
       - gemini-bot-net
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 10s
 
   telegram-bot:
     build: ./telegram-bot
@@ -31,8 +25,7 @@ services:
       - gemini-bot-net
     restart: unless-stopped
     depends_on:
-      gemini-api:
-        condition: service_healthy
+      - gemini-api
 
 networks:
   gemini-bot-net:
