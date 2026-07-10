@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 r"""
-Gemini Telegram Bot v2
+Gemini Telegram Bot v3
 - Локальный gemini-web2api (Германия -> Gemini)
 - Доступ по заявке, квоты, rate-limit
 - Система диалогов (до 30)
-- LaTeX-safe HTML, роли, кнопки
+- LaTeX-safe HTML, роли, кастомные промпты
 - Мультимодал: фото + документы
-- Инлайн через chosen_inline_result (экономия токенов)
+- Инлайн: выбор модели, кастомный промпт
 """
 
 import os
@@ -78,7 +78,6 @@ def _conn() -> sqlite3.Connection:
 def init_db() -> None:
     conn = _conn()
     c = conn.cursor()
-    # users
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -88,16 +87,23 @@ def init_db() -> None:
             blocked INTEGER DEFAULT 0,
             quota INTEGER DEFAULT 100,
             system_role TEXT,
+            custom_prompt TEXT,
+            inline_model TEXT,
+            inline_prompt TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # migrations for old dbs
-    for col, dtype in [("quota", "INTEGER DEFAULT 100"), ("system_role", "TEXT")]:
+    for col, dtype in [
+        ("quota", "INTEGER DEFAULT 100"),
+        ("system_role", "TEXT"),
+        ("custom_prompt", "TEXT"),
+        ("inline_model", "TEXT"),
+        ("inline_prompt", "TEXT"),
+    ]:
         try:
             c.execute(f"ALTER TABLE users ADD COLUMN {col} {dtype}")
         except sqlite3.OperationalError:
-            pass  # already exists
-    # dialogs
+            pass
     c.execute("""
         CREATE TABLE IF NOT EXISTS dialogs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +115,6 @@ def init_db() -> None:
             active INTEGER DEFAULT 0
         )
     """)
-    # messages inside dialogs
     c.execute("""
         CREATE TABLE IF NOT EXISTS dialog_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,7 +124,6 @@ def init_db() -> None:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # stats
     c.execute("""
         CREATE TABLE IF NOT EXISTS stats (
             user_id INTEGER PRIMARY KEY,
@@ -129,7 +133,6 @@ def init_db() -> None:
             last_used TIMESTAMP
         )
     """)
-    # rate limit log
     c.execute("""
         CREATE TABLE IF NOT EXISTS rate_limit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,14 +140,12 @@ def init_db() -> None:
             timestamp REAL
         )
     """)
-    # settings
     c.execute("""
         CREATE TABLE IF NOT EXISTS bot_settings (
             key TEXT PRIMARY KEY,
             value TEXT
         )
     """)
-    # defaults
     defaults = [
         ("rate_limit_messages", "5"),
         ("rate_limit_window", "60"),
@@ -201,13 +202,15 @@ def ensure_user(user_id: int, username: Optional[str], first_name: Optional[str]
 def get_user(user_id: int) -> Optional[Dict[str, Any]]:
     conn = _conn()
     c = conn.cursor()
-    c.execute("SELECT user_id, username, first_name, allowed, blocked, quota, system_role FROM users WHERE user_id = ?", (user_id,))
+    c.execute("SELECT user_id, username, first_name, allowed, blocked, quota, system_role, custom_prompt, inline_model, inline_prompt FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
     if row:
         return {
             "user_id": row[0], "username": row[1], "first_name": row[2],
-            "allowed": row[3], "blocked": row[4], "quota": row[5], "system_role": row[6],
+            "allowed": row[3], "blocked": row[4], "quota": row[5],
+            "system_role": row[6], "custom_prompt": row[7],
+            "inline_model": row[8], "inline_prompt": row[9],
         }
     return None
 
@@ -239,6 +242,27 @@ def set_system_role(user_id: int, role: Optional[str]) -> None:
     conn.commit()
     conn.close()
 
+def set_custom_prompt(user_id: int, prompt: Optional[str]) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET custom_prompt = ? WHERE user_id = ?", (prompt, user_id))
+    conn.commit()
+    conn.close()
+
+def set_inline_model(user_id: int, model: Optional[str]) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET inline_model = ? WHERE user_id = ?", (model, user_id))
+    conn.commit()
+    conn.close()
+
+def set_inline_prompt(user_id: int, prompt: Optional[str]) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET inline_prompt = ? WHERE user_id = ?", (prompt, user_id))
+    conn.commit()
+    conn.close()
+
 # ─── Dialog helpers ──────────────────────────────────────────────────────────
 
 def get_active_dialog(user_id: int) -> Optional[Dict[str, Any]]:
@@ -257,14 +281,12 @@ def get_active_dialog(user_id: int) -> Optional[Dict[str, Any]]:
 def create_dialog(user_id: int, title: str) -> int:
     conn = _conn()
     c = conn.cursor()
-    # deactivate others
     c.execute("UPDATE dialogs SET active = 0 WHERE user_id = ?", (user_id,))
     c.execute(
         "INSERT INTO dialogs (user_id, title, active) VALUES (?, ?, 1)",
         (user_id, title),
     )
     dialog_id = c.lastrowid
-    # keep only MAX_DIALOGS
     c.execute(
         "SELECT id FROM dialogs WHERE user_id = ? ORDER BY updated_at DESC LIMIT -1 OFFSET ?",
         (user_id, MAX_DIALOGS),
@@ -394,7 +416,6 @@ def get_all_stats() -> List[Dict[str, Any]]:
 # ─── Rate limit ──────────────────────────────────────────────────────────────
 
 def check_rate_limit(user_id: int) -> tuple:
-    """Returns (allowed: bool, retry_after: int)"""
     if user_id == ADMIN_ID:
         return True, 0
     msgs = int(get_setting("rate_limit_messages", "5"))
@@ -403,13 +424,10 @@ def check_rate_limit(user_id: int) -> tuple:
     now = time.time()
     conn = _conn()
     c = conn.cursor()
-    # clean old
     c.execute("DELETE FROM rate_limit_log WHERE timestamp < ?", (now - window,))
-    # count recent
     c.execute("SELECT COUNT(*) FROM rate_limit_log WHERE user_id = ? AND timestamp > ?", (user_id, now - window))
     count = c.fetchone()[0]
     if count >= msgs:
-        # add ignore
         add_ignore_custom(user_id, ignore_dur)
         conn.commit()
         conn.close()
@@ -437,21 +455,37 @@ def add_ignore(user_id: int) -> None:
 def add_ignore_custom(user_id: int, seconds: int) -> None:
     _ignore_cache[user_id] = time.time() + seconds - IGNORE_TTL_SEC
 
-# ─── Roles ───────────────────────────────────────────────────────────────────
-
-ROLES = {
-    "default": "",
-    "programmer": "Ты senior-разработчик. Пиши чистый, современный код с пояснениями. Используй best practices.",
-    "translator": "Ты профессиональный переводчик. Переводи точно, сохраняя стиль и контекст оригинала.",
-    "teacher": "Ты терпеливый учитель. Объясняй сложные вещи простым языком, с примерами.",
-    "concise": "Отвечай максимально кратко и по делу. Без воды и лишних вступлений.",
-    "creative": "Ты креативный помощник. Предлагай нестандартные идеи и яркие формулировки.",
-}
-
 # ─── LaTeX / HTML formatting ─────────────────────────────────────────────────
 
 def _escape(text: str) -> str:
     return html.escape(text)
+
+def _process_markdown_headers(text: str) -> str:
+    """Конвертируем Markdown заголовки (#, ##, ###) в HTML bold."""
+    def repl(m):
+        level = len(m.group(1))
+        content = m.group(2).strip()
+        if level == 1:
+            return f"<b>{_escape(content)}</b>"
+        elif level == 2:
+            return f"<b>{_escape(content)}</b>"
+        else:
+            return f"<b>{_escape(content)}</b>"
+    return re.sub(r'^(#{1,6})\s+(.+)$', repl, text, flags=re.MULTILINE)
+
+def _process_code_blocks(text: str) -> str:
+    """Обрабатываем ```text ... ``` и ``` ... ``` в <pre><code>."""
+    def repl(m):
+        lang = m.group(1) or ""
+        code = m.group(2)
+        return f"<pre><code>{_escape(code)}</code></pre>"
+    return re.sub(r'```(?:\w+)?\n(.*?)```', repl, text, flags=re.DOTALL)
+
+def _process_inline_code(text: str) -> str:
+    """Обрабатываем `код` в <code>."""
+    def repl(m):
+        return f"<code>{_escape(m.group(1))}</code>"
+    return re.sub(r'`([^`]+)`', repl, text)
 
 def format_gemini_text(raw: str) -> str:
     r"""
@@ -459,6 +493,8 @@ def format_gemini_text(raw: str) -> str:
     - Выделяет <thinking>...</thinking> в сворачиваемый blockquote
     - Экранирует HTML
     - Оборачивает LaTeX \(...\), \[...\], $...$, $$...$$ в code/pre
+    - Конвертирует Markdown заголовки в bold
+    - Обрабатывает code blocks
     """
     thinking_html = ""
     m = re.search(r'<thinking>(.*?)</thinking>', raw, re.DOTALL)
@@ -472,6 +508,10 @@ def format_gemini_text(raw: str) -> str:
                 f'{_escape(thinking)}</blockquote>\n\n'
             )
 
+    # Обрабатываем code blocks ДО LaTeX, чтобы не сломать
+    text = _process_code_blocks(text)
+
+    # LaTeX
     parts: List[str] = []
     last_end = 0
     pattern = re.compile(
@@ -497,6 +537,11 @@ def format_gemini_text(raw: str) -> str:
         parts.append(_escape(text[last_end:]))
 
     formatted = thinking_html + "".join(parts)
+
+    # Markdown заголовки и inline code (после LaTeX)
+    formatted = _process_markdown_headers(formatted)
+    formatted = _process_inline_code(formatted)
+
     if not formatted.strip():
         formatted = _escape(raw)
     return formatted
@@ -550,20 +595,32 @@ async def ask_gemini(
     dialog_id: Optional[int] = None,
     image_b64: Optional[str] = None,
     doc_text: Optional[str] = None,
+    system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     messages = []
-    # system role
-    u = get_user(user_id)
-    if u and u.get("system_role"):
-        role_text = ROLES.get(u["system_role"], "")
-        if role_text:
-            messages.append({"role": "system", "content": role_text})
 
-    # history
+    # system prompt priority: explicit > custom_prompt > role
+    u = get_user(user_id)
+    final_system = system_prompt
+    if not final_system and u and u.get("custom_prompt"):
+        final_system = u["custom_prompt"]
+    if not final_system and u and u.get("system_role"):
+        role_text = {
+            "programmer": "Ты senior-разработчик. Пиши чистый, современный код с пояснениями. Используй best practices.",
+            "translator": "Ты профессиональный переводчик. Переводи точно, сохраняя стиль и контекст оригинала.",
+            "teacher": "Ты терпеливый учитель. Объясняй сложные вещи простым языком, с примерами.",
+            "concise": "Отвечай максимально кратко и по делу. Без воды и лишних вступлений.",
+            "creative": "Ты креативный помощник. Предлагай нестандартные идеи и яркие формулировки.",
+        }.get(u["system_role"], "")
+        if role_text:
+            final_system = role_text
+
+    if final_system:
+        messages.append({"role": "system", "content": final_system})
+
     if dialog_id:
         messages.extend(get_dialog_history(dialog_id, limit=40))
 
-    # build user content
     content: Any = prompt
     if doc_text:
         content = f"{prompt}\n\n[Содержимое документа]:\n{doc_text}"
@@ -592,14 +649,12 @@ async def ask_gemini(
     choice = data.get("choices", [{}])[0]
     answer = choice.get("message", {}).get("content") or "(пустой ответ)"
 
-    # save to dialog
     if dialog_id:
         add_dialog_message(dialog_id, "user", prompt if not doc_text else f"{prompt} [+документ]")
         add_dialog_message(dialog_id, "assistant", answer)
         usage = data.get("usage", {})
         update_dialog_meta(dialog_id, (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)))
 
-    # stats
     usage = data.get("usage", {})
     update_stats(
         user_id,
@@ -608,6 +663,29 @@ async def ask_gemini(
     )
 
     return {"text": answer, "model": model}
+
+async def ask_gemini_inline(user_id: int, prompt: str, model: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
+    payload = {
+        "model": model,
+        "messages": [],
+        "stream": False,
+    }
+    if system_prompt:
+        payload["messages"].append({"role": "system", "content": system_prompt})
+    payload["messages"].append({"role": "user", "content": prompt})
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.post(GEMINI_API_URL, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", "Unknown API error"))
+
+    choice = data.get("choices", [{}])[0]
+    answer = choice.get("message", {}).get("content") or "(пустой ответ)"
+    usage = data.get("usage", {})
+    return {"text": answer, "model": model, "usage": usage}
 
 # ─── Access control ──────────────────────────────────────────────────────────
 
@@ -626,7 +704,6 @@ async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⛔ Доступ заблокирован.")
         return False
     if u and u["allowed"]:
-        # check quota
         if u["quota"] > 0:
             conn = _conn()
             c = conn.cursor()
@@ -639,7 +716,6 @@ async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     f"📛 Лимит запросов исчерпан ({u['quota']}). Обратитесь к администратору."
                 )
                 return False
-        # rate limit
         ok, retry = check_rate_limit(user_id)
         if not ok:
             await update.message.reply_text(
@@ -697,6 +773,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/dialog — мои диалоги\n"
         "/model — выбрать модель\n"
         "/role — выбрать роль\n"
+        "/prompt — свой системный промпт\n"
+        "/inlinemodel — модель для инлайна\n"
+        "/inlineprompt — промпт для инлайна\n"
         "/clear — очистить активный диалог\n"
         "/help — справка\n"
     )
@@ -719,7 +798,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
         return
     dialog_id = create_dialog(update.effective_user.id, "Новый диалог")
-    await update.message.reply_text(f"✅ Создан новый диалог <code>#{dialog_id}</code>. Старые сообщения не пропали — они в /dialog.", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(f"✅ Создан новый диалог <code>#{dialog_id}</code>.", parse_mode=ParseMode.HTML)
 
 async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
@@ -763,6 +842,51 @@ async def cmd_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ])
     await update.message.reply_text("Выберите роль бота:", reply_markup=keyboard)
 
+async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    if not context.args:
+        u = get_user(update.effective_user.id)
+        current = u.get("custom_prompt") or "(не задан)"
+        await update.message.reply_text(
+            f"<b>Текущий промпт:</b>\n<code>{html.escape(current[:500])}</code>\n\n"
+            f"Чтобы изменить: <code>/prompt Твой промпт...</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    prompt = " ".join(context.args)
+    set_custom_prompt(update.effective_user.id, prompt)
+    await update.message.reply_text("✅ Промпт сохранён. Он будет использоваться вместо роли.")
+
+async def cmd_inlinemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Flash", callback_data="inlinemodel:gemini-3.5-flash")],
+        [InlineKeyboardButton("🧠 Flash Thinking", callback_data="inlinemodel:gemini-3.5-flash-thinking")],
+        [InlineKeyboardButton("🔬 Pro", callback_data="inlinemodel:gemini-3.1-pro")],
+        [InlineKeyboardButton("🎯 Auto", callback_data="inlinemodel:gemini-auto")],
+        [InlineKeyboardButton("💡 Flash Thinking Lite", callback_data="inlinemodel:gemini-3.5-flash-thinking-lite")],
+        [InlineKeyboardButton("🪶 Flash Lite", callback_data="inlinemodel:gemini-flash-lite")],
+    ])
+    await update.message.reply_text("Выберите модель для инлайн-режима:", reply_markup=keyboard)
+
+async def cmd_inlineprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    if not context.args:
+        u = get_user(update.effective_user.id)
+        current = u.get("inline_prompt") or "(не задан)"
+        await update.message.reply_text(
+            f"<b>Текущий инлайн-промпт:</b>\n<code>{html.escape(current[:500])}</code>\n\n"
+            f"Чтобы изменить: <code>/inlineprompt Твой промпт...</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    prompt = " ".join(context.args)
+    set_inline_prompt(update.effective_user.id, prompt)
+    await update.message.reply_text("✅ Инлайн-промпт сохранён.")
+
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
         return
@@ -796,8 +920,18 @@ async def callback_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if data.startswith("role:"):
         role = data.split(":", 1)[1]
         set_system_role(update.effective_user.id, role if role != "default" else None)
+        set_custom_prompt(update.effective_user.id, None)
         name = {"programmer": "💻 Программист", "translator": "🌐 Переводчик", "teacher": "📚 Учитель", "concise": "✂️ Кратко", "creative": "🎨 Креатив"}.get(role, "🔄 Обычный")
         await query.edit_message_text(f"✅ Роль: {name}", parse_mode=ParseMode.HTML)
+
+async def callback_inlinemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("inlinemodel:"):
+        model = data.split(":", 1)[1]
+        set_inline_model(update.effective_user.id, model)
+        await query.edit_message_text(f"✅ Инлайн-модель: <code>{html.escape(model)}</code>", parse_mode=ParseMode.HTML)
 
 async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -864,13 +998,11 @@ async def _process_text(
     user_id = user.id
     model = context.user_data.get("model", DEFAULT_MODEL)
 
-    # ensure active dialog
     dialog = get_active_dialog(user_id)
     if not dialog:
         dialog_id = create_dialog(user_id, make_title_from_text(prompt))
     else:
         dialog_id = dialog["id"]
-        # update title if empty/default and this is first user message
         conn = _conn()
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM dialog_messages WHERE dialog_id = ?", (dialog_id,))
@@ -903,7 +1035,6 @@ async def _process_text(
     formatted = format_gemini_text(result["text"])
     chunks = split_message(formatted)
 
-    # store for buttons
     context.user_data["last_prompt"] = prompt
 
     try:
@@ -999,7 +1130,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await _process_text(update, context, prompt, doc_text=doc_text)
 
-# ─── Inline mode (placeholder + keyboard → chosen_inline_result) ───────────
+# ─── Inline mode ─────────────────────────────────────────────────────────────
 
 WAIT_KEYBOARD = InlineKeyboardMarkup([
     [InlineKeyboardButton(text="⏳ Ответ генерируется…", callback_data="ai_wait")]
@@ -1035,28 +1166,10 @@ async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     ]
     await update.inline_query.answer(results, cache_time=0, is_personal=True)
 
-async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
-    """Быстрый запрос для inline с таймаутом."""
-    payload = {
-        "model": INLINE_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        resp = await client.post(GEMINI_API_URL, json=payload, headers=HEADERS)
-        resp.raise_for_status()
-        data = resp.json()
-
-    if "error" in data:
-        raise RuntimeError(data["error"].get("message", "Unknown API error"))
-
-    choice = data.get("choices", [{}])[0]
-    answer = choice.get("message", {}).get("content") or "(пустой ответ)"
-    usage = data.get("usage", {})
-    return {"text": answer, "model": INLINE_MODEL, "usage": usage}
+async def callback_ai_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer("Ответ ещё генерируется…", cache_time=1)
 
 async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка выбранного inline-результата в фоне."""
     chosen = update.chosen_inline_result
     if not chosen or chosen.result_id != "gemini_inline":
         return
@@ -1072,8 +1185,13 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
         if not u or not u["allowed"] or u["blocked"]:
             return
 
+    # Получаем настройки пользователя для инлайна
+    u = get_user(user_id)
+    inline_model = (u.get("inline_model") or INLINE_MODEL) if u else INLINE_MODEL
+    inline_prompt = u.get("inline_prompt") if u else None
+
     try:
-        result = await ask_gemini_inline(user_id, query_text)
+        result = await ask_gemini_inline(user_id, query_text, inline_model, system_prompt=inline_prompt)
         formatted = format_gemini_text(result["text"])
         if len(formatted) > 4000:
             formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
@@ -1110,12 +1228,7 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as e:
             logger.error(f"Inline PM fallback failed: {e}")
 
-async def callback_ai_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Заглушка для кнопки ожидания в inline-сообщении."""
-    await update.callback_query.answer("Ответ ещё генерируется…", cache_time=1)
-
 async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Запускаем обработку в фоне, чтобы не блокировать бота."""
     import asyncio
     asyncio.create_task(_process_inline_chosen(update, context))
 
@@ -1243,7 +1356,6 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         dst = f"/app/data/backups/bot_{ts}.db"
         if os.path.exists(src):
             shutil.copy2(src, dst)
-            # keep last 10
             files = sorted(
                 [f for f in os.listdir("/app/data/backups") if f.startswith("bot_")],
                 key=lambda x: os.path.getmtime(os.path.join("/app/data/backups", x)),
@@ -1280,6 +1392,9 @@ def main() -> None:
     application.add_handler(CommandHandler("dialog", cmd_dialogs))
     application.add_handler(CommandHandler("model", cmd_model))
     application.add_handler(CommandHandler("role", cmd_role))
+    application.add_handler(CommandHandler("prompt", cmd_prompt))
+    application.add_handler(CommandHandler("inlinemodel", cmd_inlinemodel))
+    application.add_handler(CommandHandler("inlineprompt", cmd_inlineprompt))
     application.add_handler(CommandHandler("clear", cmd_clear))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("users", cmd_users))
@@ -1291,6 +1406,7 @@ def main() -> None:
     # callbacks
     application.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(callback_role, pattern=r"^role:"))
+    application.add_handler(CallbackQueryHandler(callback_inlinemodel, pattern=r"^inlinemodel:"))
     application.add_handler(CallbackQueryHandler(callback_switch, pattern=r"^switch:"))
     application.add_handler(CallbackQueryHandler(callback_admin, pattern=r"^(allow|ignore):"))
     application.add_handler(CallbackQueryHandler(callback_actions, pattern=r"^(rephrase|continue|delete):"))
@@ -1302,17 +1418,3 @@ def main() -> None:
 
     # messages
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # errors
-    application.add_error_handler(error_handler)
-
-    # backup job at 04:00
-    application.job_queue.run_daily(backup_job, time=time(hour=4, minute=0))
-
-    logger.info("Бот запущен. Ожидаю сообщения...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
