@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 r"""
-Gemini Telegram Bot v3
-- Локальный gemini-web2api (Германия -> Gemini)
-- Доступ по заявке, квоты, rate-limit
-- Система диалогов (до 30)
-- LaTeX-safe HTML, роли, кастомные промпты
-- Мультимодал: фото + документы
-- Инлайн: выбор модели, кастомный промпт
+Gemini Telegram Bot v4
+- Переиспользуемый HTTP-клиент с semaphore и retry
+- Безопасное HTML-форматирование (не режет теги)
+- Ограничение истории диалога
+- WAL SQLite с индексами
+- Блокировка на пользователя при concurrent updates
 """
 
 import os
@@ -20,8 +19,10 @@ import logging
 import shutil
 import base64
 import io
+import asyncio
+import hashlib
+import random
 from datetime import datetime, timedelta, time as dt_time
-import time as _time_module
 from typing import Optional, List, Dict, Any
 
 import httpx
@@ -33,6 +34,7 @@ from telegram import (
     InputTextMessageContent,
 )
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -60,6 +62,40 @@ if not BOT_TOKEN:
 if not ADMIN_ID:
     raise SystemExit("ADMIN_ID не задан в .env")
 
+# ─── Env helpers ─────────────────────────────────────────────────────────────
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+GEMINI_CONNECT_TIMEOUT = env_float("GEMINI_CONNECT_TIMEOUT", 10.0)
+GEMINI_READ_TIMEOUT = env_float("GEMINI_READ_TIMEOUT", 300.0)
+GEMINI_WRITE_TIMEOUT = env_float("GEMINI_WRITE_TIMEOUT", 60.0)
+GEMINI_POOL_TIMEOUT = env_float("GEMINI_POOL_TIMEOUT", 30.0)
+GEMINI_RETRIES = max(0, env_int("GEMINI_RETRIES", 2))
+GEMINI_RETRY_READ_TIMEOUT = env_bool("GEMINI_RETRY_READ_TIMEOUT", False)
+GEMINI_MAX_CONCURRENT = max(1, env_int("GEMINI_MAX_CONCURRENT", 3))
+GEMINI_MAX_CONNECTIONS = max(GEMINI_MAX_CONCURRENT, env_int("GEMINI_MAX_CONNECTIONS", 10))
+GEMINI_MAX_TOKENS = max(0, env_int("GEMINI_MAX_TOKENS", 4096))
+GEMINI_INLINE_MAX_TOKENS = max(0, env_int("GEMINI_INLINE_MAX_TOKENS", 1400))
+GEMINI_HISTORY_MESSAGES = max(2, env_int("GEMINI_HISTORY_MESSAGES", 24))
+GEMINI_HISTORY_CHARS = max(2000, env_int("GEMINI_HISTORY_CHARS", 30000))
+TELEGRAM_CONCURRENT_UPDATES = max(1, env_int("TELEGRAM_CONCURRENT_UPDATES", 16))
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -68,17 +104,141 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ─── Gemini HTTP Client ──────────────────────────────────────────────────────
+
+HEADERS = {"Content-Type": "application/json"}
+if API_KEY:
+    HEADERS["Authorization"] = f"Bearer {API_KEY}"
+
+class GeminiRequestError(RuntimeError):
+    pass
+
+class GeminiTimeoutError(GeminiRequestError):
+    pass
+
+class GeminiTransportError(GeminiRequestError):
+    pass
+
+class GeminiClient:
+    RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+    def __init__(self) -> None:
+        timeout = httpx.Timeout(
+            connect=GEMINI_CONNECT_TIMEOUT,
+            read=GEMINI_READ_TIMEOUT,
+            write=GEMINI_WRITE_TIMEOUT,
+            pool=GEMINI_POOL_TIMEOUT,
+        )
+        limits = httpx.Limits(
+            max_connections=GEMINI_MAX_CONNECTIONS,
+            max_keepalive_connections=GEMINI_MAX_CONNECTIONS,
+            keepalive_expiry=30.0,
+        )
+        self._semaphore = asyncio.Semaphore(GEMINI_MAX_CONCURRENT)
+        self._client = httpx.AsyncClient(
+            headers=HEADERS,
+            timeout=timeout,
+            limits=limits,
+            follow_redirects=True,
+            trust_env=False,
+        )
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    @staticmethod
+    def _retry_delay(attempt: int, response: Optional[httpx.Response] = None) -> float:
+        if response is not None:
+            retry_after = response.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return min(max(float(retry_after), 0.5), 30.0)
+                except ValueError:
+                    pass
+        return min(2 ** attempt, 8) + random.uniform(0.0, 0.5)
+
+    async def _sleep_before_retry(self, attempt: int, reason: str, response: Optional[httpx.Response] = None) -> None:
+        delay = self._retry_delay(attempt, response)
+        logger.warning("Gemini retry %s/%s in %.1f sec: %s", attempt + 1, GEMINI_RETRIES, delay, reason)
+        await asyncio.sleep(delay)
+
+    async def complete(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        for attempt in range(GEMINI_RETRIES + 1):
+            try:
+                async with self._semaphore:
+                    response = await self._client.post(GEMINI_API_URL, json=payload)
+            except httpx.ReadTimeout as exc:
+                can_retry = GEMINI_RETRY_READ_TIMEOUT and attempt < GEMINI_RETRIES
+                if can_retry:
+                    await self._sleep_before_retry(attempt, "read timeout")
+                    continue
+                raise GeminiTimeoutError(f"Gemini не ответил за {GEMINI_READ_TIMEOUT:.0f} секунд") from exc
+            except httpx.TransportError as exc:
+                if attempt < GEMINI_RETRIES:
+                    await self._sleep_before_retry(attempt, type(exc).__name__)
+                    continue
+                raise GeminiTransportError("Не удалось подключиться к Gemini API") from exc
+
+            if response.status_code in self.RETRYABLE_STATUS_CODES:
+                if attempt < GEMINI_RETRIES:
+                    await self._sleep_before_retry(attempt, f"HTTP {response.status_code}", response)
+                    continue
+
+            response.raise_for_status()
+
+            try:
+                data = response.json()
+            except ValueError as exc:
+                body = response.text[:500]
+                raise GeminiRequestError(f"Gemini вернул не JSON: {body}") from exc
+
+            api_error = data.get("error")
+            if api_error:
+                if isinstance(api_error, dict):
+                    message = api_error.get("message") or str(api_error)
+                else:
+                    message = str(api_error)
+                raise GeminiRequestError(message)
+
+            return data
+
+        raise GeminiRequestError("Неизвестная ошибка Gemini API")
+
+gemini_client: Optional[GeminiClient] = None
+
+async def post_init(application: Application) -> None:
+    global gemini_client
+    gemini_client = GeminiClient()
+    logger.info("Gemini HTTP client started: timeout=%ss, concurrency=%s", GEMINI_READ_TIMEOUT, GEMINI_MAX_CONCURRENT)
+
+async def post_shutdown(application: Application) -> None:
+    global gemini_client
+    if gemini_client is not None:
+        await gemini_client.close()
+        gemini_client = None
+    logger.info("Gemini HTTP client stopped")
+
+def get_gemini_client() -> GeminiClient:
+    if gemini_client is None:
+        raise RuntimeError("Gemini HTTP client is not initialized")
+    return gemini_client
+
 # ─── Database ────────────────────────────────────────────────────────────────
 
 DB_PATH = "/app/data/bot.db"
 
 def _conn() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
 def init_db() -> None:
     conn = _conn()
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode = WAL")
+    c.execute("PRAGMA synchronous = NORMAL")
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -95,11 +255,8 @@ def init_db() -> None:
         )
     """)
     for col, dtype in [
-        ("quota", "INTEGER DEFAULT 100"),
-        ("system_role", "TEXT"),
-        ("custom_prompt", "TEXT"),
-        ("inline_model", "TEXT"),
-        ("inline_prompt", "TEXT"),
+        ("quota", "INTEGER DEFAULT 100"), ("system_role", "TEXT"),
+        ("custom_prompt", "TEXT"), ("inline_model", "TEXT"), ("inline_prompt", "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE users ADD COLUMN {col} {dtype}")
@@ -147,6 +304,10 @@ def init_db() -> None:
             value TEXT
         )
     """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_dialogs_user_active ON dialogs(user_id, active, updated_at)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_messages_dialog_id ON dialog_messages(dialog_id, id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_rate_limit_user_time ON rate_limit_log(user_id, timestamp)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_rate_limit_time ON rate_limit_log(timestamp)")
     defaults = [
         ("rate_limit_messages", "5"),
         ("rate_limit_window", "60"),
@@ -283,15 +444,9 @@ def create_dialog(user_id: int, title: str) -> int:
     conn = _conn()
     c = conn.cursor()
     c.execute("UPDATE dialogs SET active = 0 WHERE user_id = ?", (user_id,))
-    c.execute(
-        "INSERT INTO dialogs (user_id, title, active) VALUES (?, ?, 1)",
-        (user_id, title),
-    )
+    c.execute("INSERT INTO dialogs (user_id, title, active) VALUES (?, ?, 1)", (user_id, title))
     dialog_id = c.lastrowid
-    c.execute(
-        "SELECT id FROM dialogs WHERE user_id = ? ORDER BY updated_at DESC LIMIT -1 OFFSET ?",
-        (user_id, MAX_DIALOGS),
-    )
+    c.execute("SELECT id FROM dialogs WHERE user_id = ? ORDER BY updated_at DESC LIMIT -1 OFFSET ?", (user_id, MAX_DIALOGS))
     for old in c.fetchall():
         c.execute("DELETE FROM dialog_messages WHERE dialog_id = ?", (old[0],))
         c.execute("DELETE FROM dialogs WHERE id = ?", (old[0],))
@@ -321,10 +476,7 @@ def get_dialogs(user_id: int) -> List[Dict[str, Any]]:
     )
     rows = c.fetchall()
     conn.close()
-    return [
-        {"id": r[0], "title": r[1], "token_count": r[2], "updated_at": r[3], "active": r[4]}
-        for r in rows
-    ]
+    return [{"id": r[0], "title": r[1], "token_count": r[2], "updated_at": r[3], "active": r[4]} for r in rows]
 
 def get_dialog_history(dialog_id: int, limit: int = 40) -> List[Dict[str, str]]:
     conn = _conn()
@@ -341,16 +493,9 @@ def get_dialog_history(dialog_id: int, limit: int = 40) -> List[Dict[str, str]]:
 def add_dialog_message(dialog_id: int, role: str, content: str, max_msgs: int = 50) -> None:
     conn = _conn()
     c = conn.cursor()
+    c.execute("INSERT INTO dialog_messages (dialog_id, role, content) VALUES (?, ?, ?)", (dialog_id, role, content))
     c.execute(
-        "INSERT INTO dialog_messages (dialog_id, role, content) VALUES (?, ?, ?)",
-        (dialog_id, role, content),
-    )
-    c.execute(
-        """
-        DELETE FROM dialog_messages WHERE id IN (
-            SELECT id FROM dialog_messages WHERE dialog_id = ? ORDER BY id DESC LIMIT -1 OFFSET ?
-        )
-        """,
+        "DELETE FROM dialog_messages WHERE id IN (SELECT id FROM dialog_messages WHERE dialog_id = ? ORDER BY id DESC LIMIT -1 OFFSET ?)",
         (dialog_id, max_msgs),
     )
     conn.commit()
@@ -359,10 +504,7 @@ def add_dialog_message(dialog_id: int, role: str, content: str, max_msgs: int = 
 def update_dialog_meta(dialog_id: int, token_delta: int) -> None:
     conn = _conn()
     c = conn.cursor()
-    c.execute(
-        "UPDATE dialogs SET token_count = token_count + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (token_delta, dialog_id),
-    )
+    c.execute("UPDATE dialogs SET token_count = token_count + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (token_delta, dialog_id))
     conn.commit()
     conn.close()
 
@@ -375,23 +517,26 @@ def update_dialog_title(dialog_id: int, title: str) -> None:
 
 # ─── Stats ───────────────────────────────────────────────────────────────────
 
-def update_stats(user_id: int, prompt_len: int, completion_len: int) -> None:
+def update_stats(user_id: int, prompt_tokens: int, completion_tokens: int) -> None:
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    completion_tokens = max(0, int(completion_tokens or 0))
     conn = _conn()
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO stats (user_id, requests, tokens_prompt, tokens_completion, last_used)
-        VALUES (?, 1, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            requests = requests + 1,
-            tokens_prompt = tokens_prompt + excluded.tokens_prompt,
-            tokens_completion = tokens_completion + excluded.tokens_completion,
-            last_used = excluded.last_used
-        """,
-        (user_id, prompt_len // 4, completion_len // 4, datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute(
+            """
+            INSERT INTO stats (user_id, requests, tokens_prompt, tokens_completion, last_used)
+            VALUES (?, 1, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                requests = requests + 1,
+                tokens_prompt = tokens_prompt + excluded.tokens_prompt,
+                tokens_completion = tokens_completion + excluded.tokens_completion,
+                last_used = excluded.last_used
+            """,
+            (user_id, prompt_tokens, completion_tokens, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 def get_all_stats() -> List[Dict[str, Any]]:
     conn = _conn()
@@ -406,15 +551,12 @@ def get_all_stats() -> List[Dict[str, Any]]:
     rows = c.fetchall()
     conn.close()
     return [
-        {
-            "user_id": r[0], "username": r[1], "first_name": r[2],
-            "allowed": r[3], "blocked": r[4], "quota": r[5],
-            "requests": r[6], "tokens_prompt": r[7], "tokens_completion": r[8],
-        }
+        {"user_id": r[0], "username": r[1], "first_name": r[2], "allowed": r[3], "blocked": r[4], "quota": r[5],
+         "requests": r[6], "tokens_prompt": r[7], "tokens_completion": r[8]}
         for r in rows
     ]
 
-# ─── Rate limit ──────────────────────────────────────────────────────────────
+# ─── Rate limit ─────────────────────────────────────────────────────────────-
 
 def check_rate_limit(user_id: int) -> tuple:
     if user_id == ADMIN_ID:
@@ -422,7 +564,7 @@ def check_rate_limit(user_id: int) -> tuple:
     msgs = int(get_setting("rate_limit_messages", "5"))
     window = int(get_setting("rate_limit_window", "60"))
     ignore_dur = int(get_setting("rate_limit_ignore", "600"))
-    now = _time_module.time()
+    now = time.monotonic()
     conn = _conn()
     c = conn.cursor()
     c.execute("DELETE FROM rate_limit_log WHERE timestamp < ?", (now - window,))
@@ -440,154 +582,123 @@ def check_rate_limit(user_id: int) -> tuple:
 
 # ─── Ignore list ─────────────────────────────────────────────────────────────
 
-_ignore_cache: Dict[int, float] = {}
+_ignore_until: Dict[int, float] = {}
 
 def is_ignored(user_id: int) -> bool:
-    ts = _ignore_cache.get(user_id, 0)
-    if _time_module.time() - ts < IGNORE_TTL_SEC:
-        return True
-    if user_id in _ignore_cache:
-        del _ignore_cache[user_id]
-    return False
+    expires_at = _ignore_until.get(user_id)
+    if expires_at is None:
+        return False
+    if time.monotonic() >= expires_at:
+        _ignore_until.pop(user_id, None)
+        return False
+    return True
 
 def add_ignore(user_id: int) -> None:
-    _ignore_cache[user_id] = _time_module.time()
+    add_ignore_custom(user_id, IGNORE_TTL_SEC)
 
 def add_ignore_custom(user_id: int, seconds: int) -> None:
-    _ignore_cache[user_id] = _time_module.time() + seconds - IGNORE_TTL_SEC
+    _ignore_until[user_id] = time.monotonic() + max(1, seconds)
 
 # ─── LaTeX / HTML formatting ─────────────────────────────────────────────────
 
-def _escape(text: str) -> str:
-    return html.escape(text)
-
-def _process_markdown_headers(text: str) -> str:
-    """Конвертируем Markdown заголовки (#, ##, ###) в HTML bold."""
-    def repl(m):
-        level = len(m.group(1))
-        content = m.group(2).strip()
-        if level == 1:
-            return f"<b>{_escape(content)}</b>"
-        elif level == 2:
-            return f"<b>{_escape(content)}</b>"
-        else:
-            return f"<b>{_escape(content)}</b>"
-    return re.sub(r'^(#{1,6})\s+(.+)$', repl, text, flags=re.MULTILINE)
-
-def _process_code_blocks(text: str) -> str:
-    """Обрабатываем ```text ... ``` и ``` ... ``` в <pre><code>."""
-    def repl(m):
-        lang = m.group(1) or ""
-        code = m.group(2)
-        return f"<pre><code>{_escape(code)}</code></pre>"
-    return re.sub(r'```(?:\w+)?\n(.*?)```', repl, text, flags=re.DOTALL)
-
-def _process_inline_code(text: str) -> str:
-    """Обрабатываем `код` в <code>."""
-    def repl(m):
-        return f"<code>{_escape(m.group(1))}</code>"
-    return re.sub(r'`([^`]+)`', repl, text)
+def split_plain_text(text: str, max_len: int = 3500) -> List[str]:
+    text = (text or "").strip()
+    if not text:
+        return ["(пустой ответ)"]
+    chunks: List[str] = []
+    while len(text) > max_len:
+        positions = [text.rfind("\n\n", 0, max_len + 1), text.rfind("\n", 0, max_len + 1), text.rfind(" ", 0, max_len + 1)]
+        cut = max(positions)
+        if cut < max_len // 2:
+            cut = max_len
+        chunk = text[:cut].rstrip()
+        if not chunk:
+            chunk = text[:max_len]
+            cut = max_len
+        chunks.append(chunk)
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    return chunks
 
 def format_gemini_text(raw: str) -> str:
-    r"""
-    Обрабатывает текст от Gemini для Telegram HTML:
-    - Выделяет <thinking>...</thinking> в сворачиваемый blockquote
-    - Экранирует HTML
-    - Оборачивает LaTeX \(...\), \[...\], $...$, $$...$$ в code/pre
-    - Конвертирует Markdown заголовки в bold
-    - Обрабатывает code blocks
-    """
+    raw = str(raw or "")
+    thinking_blocks = re.findall(r"<thinking>(.*?)</thinking>", raw, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<thinking>.*?</thinking>", "", raw, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    replacements: List[str] = []
+    def stash(value: str) -> str:
+        token = f"\uE000{len(replacements)}\uE001"
+        replacements.append(value)
+        return token
+
+    # ```code blocks```
+    def replace_code_block(match: re.Match) -> str:
+        code = match.group(2) or ""
+        return stash(f"<pre><code>{html.escape(code.strip())}</code></pre>")
+    text = re.sub(r"```(?:([A-Za-z0-9_+.\-]+)\n)?(.*?)```", replace_code_block, text, flags=re.DOTALL)
+
+    # \[...\] и $$...$$
+    def replace_display_math(match: re.Match) -> str:
+        value = match.group(1) if match.group(1) is not None else match.group(2)
+        return stash(f"<pre>{html.escape((value or '').strip())}</pre>")
+    text = re.sub(r"\\\[(.*?)\\\]|\$\$(.*?)\$\$", replace_display_math, text, flags=re.DOTALL)
+
+    # \(...\) и $...$
+    def replace_inline_math(match: re.Match) -> str:
+        value = match.group(1) if match.group(1) is not None else match.group(2)
+        return stash(f"<code>{html.escape((value or '').strip())}</code>")
+    text = re.sub(r"\\\((.*?)\\\)|(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)", replace_inline_math, text, flags=re.DOTALL)
+
+    # `inline code`
+    text = re.sub(r"`([^`\n]+)`", lambda m: stash(f"<code>{html.escape(m.group(1))}</code>"), text)
+
+    # Экранируем обычный текст
+    formatted = html.escape(text)
+
+    # Заголовки
+    formatted = re.sub(r"(?m)^#{1,6}[ \t]+(.+)$", r"<b>\1</b>", formatted)
+    # **bold**
+    formatted = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", formatted)
+
+    # Возвращаем безопасные HTML-фрагменты
+    for index, replacement in enumerate(replacements):
+        formatted = formatted.replace(f"\uE000{index}\uE001", replacement)
+
     thinking_html = ""
-    m = re.search(r'<thinking>(.*?)</thinking>', raw, re.DOTALL)
-    text = raw
-    if m:
-        thinking = m.group(1).strip()
-        text = re.sub(r'<thinking>.*?</thinking>', '', raw, flags=re.DOTALL, count=1).strip()
+    if thinking_blocks:
+        thinking = "\n\n".join(part.strip() for part in thinking_blocks if part.strip())
         if thinking:
-            thinking_html = (
-                f'<blockquote expandable><b>🧠 Рассуждение:</b>\n'
-                f'{_escape(thinking)}</blockquote>\n\n'
-            )
+            thinking_html = f'<blockquote expandable><b>🧠 Рассуждение:</b>\n{html.escape(thinking)}</blockquote>\n\n'
 
-    # Обрабатываем code blocks ДО LaTeX, чтобы не сломать
-    text = _process_code_blocks(text)
-
-    # LaTeX
-    parts: List[str] = []
-    last_end = 0
-    pattern = re.compile(
-        r'(\\\((.*?)\\\)|\\\[(.*?)\\\]|(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)|\$\$(.*?)\$\$)',
-        re.DOTALL,
-    )
-
-    for match in pattern.finditer(text):
-        start, end = match.span()
-        if start > last_end:
-            parts.append(_escape(text[last_end:start]))
-        if match.group(2) is not None:
-            parts.append(f'<code>{_escape(match.group(2))}</code>')
-        elif match.group(3) is not None:
-            parts.append(f'<pre>{_escape(match.group(3))}</pre>')
-        elif match.group(4) is not None:
-            parts.append(f'<code>{_escape(match.group(4))}</code>')
-        elif match.group(5) is not None:
-            parts.append(f'<pre>{_escape(match.group(5))}</pre>')
-        last_end = end
-
-    if last_end < len(text):
-        parts.append(_escape(text[last_end:]))
-
-    formatted = thinking_html + "".join(parts)
-
-    # Markdown заголовки и inline code (после LaTeX)
-    formatted = _process_markdown_headers(formatted)
-    formatted = _process_inline_code(formatted)
-
-    if not formatted.strip():
-        formatted = _escape(raw)
-    return formatted
-
-def split_message(text: str, max_len: int = 4000) -> List[str]:
-    if len(text) <= max_len:
-        return [text]
-    chunks = []
-    current = ""
-    for paragraph in text.split('\n\n'):
-        para = paragraph + '\n\n'
-        if len(current) + len(para) > max_len:
-            if current:
-                chunks.append(current.rstrip())
-            current = para
-        else:
-            current += para
-    if current:
-        chunks.append(current.rstrip())
-    final = []
-    for ch in chunks:
-        if len(ch) <= max_len:
-            final.append(ch)
-            continue
-        sub = ""
-        for line in ch.split('\n'):
-            if len(sub) + len(line) + 1 > max_len:
-                final.append(sub)
-                sub = line + '\n'
-            else:
-                sub += line + '\n'
-        if sub:
-            final.append(sub)
-    return final
+    return thinking_html + formatted.strip()
 
 def make_title_from_text(text: str) -> str:
     words = text.strip().split()
     title = " ".join(words[:8])[:60]
     return title or "Новый диалог"
 
-# ─── Gemini API client ───────────────────────────────────────────────────────
+# ─── History trimming ────────────────────────────────────────────────────────
 
-HEADERS = {"Content-Type": "application/json"}
-if API_KEY:
-    HEADERS["Authorization"] = f"Bearer {API_KEY}"
+def trim_dialog_history(messages: List[Dict[str, Any]], max_chars: int = GEMINI_HISTORY_CHARS) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    total_chars = 0
+    for message in reversed(messages):
+        content = message.get("content", "")
+        content_size = len(content) if isinstance(content, str) else len(json.dumps(content, ensure_ascii=False))
+        if result and total_chars + content_size > max_chars:
+            break
+        if content_size > max_chars and not result:
+            if isinstance(content, str):
+                message = {**message, "content": content[-max_chars:]}
+            result.append(message)
+            break
+        result.append(message)
+        total_chars += content_size
+    result.reverse()
+    return result
+
+# ─── Gemini API ──────────────────────────────────────────────────────────────
 
 async def ask_gemini(
     user_id: int,
@@ -599,54 +710,43 @@ async def ask_gemini(
     system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     messages = []
-
-    # system prompt priority: explicit > custom_prompt > role
     u = get_user(user_id)
     final_system = system_prompt
     if not final_system and u and u.get("custom_prompt"):
         final_system = u["custom_prompt"]
     if not final_system and u and u.get("system_role"):
         role_text = {
-            "programmer": "Ты senior-разработчик. Пиши чистый, современный код с пояснениями. Используй best practices.",
-            "translator": "Ты профессиональный переводчик. Переводи точно, сохраняя стиль и контекст оригинала.",
+            "programmer": "Ты senior-разработчик. Пиши чистый, современный код с пояснениями.",
+            "translator": "Ты профессиональный переводчик. Переводи точно, сохраняя стиль.",
             "teacher": "Ты терпеливый учитель. Объясняй сложные вещи простым языком, с примерами.",
-            "concise": "Отвечай максимально кратко и по делу. Без воды и лишних вступлений.",
-            "creative": "Ты креативный помощник. Предлагай нестандартные идеи и яркие формулировки.",
+            "concise": "Отвечай максимально кратко и по делу. Без воды.",
+            "creative": "Ты креативный помощник. Предлагай нестандартные идеи.",
         }.get(u["system_role"], "")
         if role_text:
             final_system = role_text
-
     if final_system:
         messages.append({"role": "system", "content": final_system})
 
     if dialog_id:
-        messages.extend(get_dialog_history(dialog_id, limit=40))
+        history = await asyncio.to_thread(get_dialog_history, dialog_id, GEMINI_HISTORY_MESSAGES)
+        messages.extend(trim_dialog_history(history))
 
     content: Any = prompt
     if doc_text:
         content = f"{prompt}\n\n[Содержимое документа]:\n{doc_text}"
     if image_b64:
+        text_content = content if isinstance(content, str) else prompt
         content = [
-            {"type": "text", "text": prompt},
+            {"type": "text", "text": text_content},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
         ]
-
     messages.append({"role": "user", "content": content})
 
-    payload = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-    }
+    payload = {"model": model, "messages": messages, "stream": False}
+    if GEMINI_MAX_TOKENS > 0:
+        payload["max_tokens"] = GEMINI_MAX_TOKENS
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        resp = await client.post(GEMINI_API_URL, json=payload, headers=HEADERS)
-        resp.raise_for_status()
-        data = resp.json()
-
-    if "error" in data:
-        raise RuntimeError(data["error"].get("message", "Unknown API error"))
-
+    data = await get_gemini_client().complete(payload)
     choice = data.get("choices", [{}])[0]
     answer = choice.get("message", {}).get("content") or "(пустой ответ)"
 
@@ -654,35 +754,28 @@ async def ask_gemini(
         add_dialog_message(dialog_id, "user", prompt if not doc_text else f"{prompt} [+документ]")
         add_dialog_message(dialog_id, "assistant", answer)
         usage = data.get("usage", {})
-        update_dialog_meta(dialog_id, (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)))
+        update_dialog_meta(dialog_id, usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
 
     usage = data.get("usage", {})
-    update_stats(
-        user_id,
-        usage.get("prompt_tokens", 0) * 4,
-        usage.get("completion_tokens", 0) * 4,
-    )
+    pt = usage.get("prompt_tokens")
+    if pt is None:
+        pt = max(1, len(json.dumps(messages, ensure_ascii=False)) // 4)
+    ct = usage.get("completion_tokens")
+    if ct is None:
+        ct = max(1, len(answer) // 4)
+    await asyncio.to_thread(update_stats, user_id, pt, ct)
 
     return {"text": answer, "model": model}
 
 async def ask_gemini_inline(user_id: int, prompt: str, model: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
-    payload = {
-        "model": model,
-        "messages": [],
-        "stream": False,
-    }
+    payload = {"model": model, "messages": [], "stream": False}
     if system_prompt:
         payload["messages"].append({"role": "system", "content": system_prompt})
     payload["messages"].append({"role": "user", "content": prompt})
+    if GEMINI_INLINE_MAX_TOKENS > 0:
+        payload["max_tokens"] = GEMINI_INLINE_MAX_TOKENS
 
-    async with httpx.AsyncClient(timeout=90.0) as client:
-        resp = await client.post(GEMINI_API_URL, json=payload, headers=HEADERS)
-        resp.raise_for_status()
-        data = resp.json()
-
-    if "error" in data:
-        raise RuntimeError(data["error"].get("message", "Unknown API error"))
-
+    data = await get_gemini_client().complete(payload)
     choice = data.get("choices", [{}])[0]
     answer = choice.get("message", {}).get("content") or "(пустой ответ)"
     usage = data.get("usage", {})
@@ -696,10 +789,8 @@ async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return False
     user_id = user.id
     ensure_user(user_id, user.username, user.first_name, allowed=1 if user_id == ADMIN_ID else 0)
-
     if user_id == ADMIN_ID:
         return True
-
     u = get_user(user_id)
     if u and u["blocked"]:
         await update.message.reply_text("⛔ Доступ заблокирован.")
@@ -713,26 +804,18 @@ async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             conn.close()
             used = row[0] if row else 0
             if used >= u["quota"]:
-                await update.message.reply_text(
-                    f"📛 Лимит запросов исчерпан ({u['quota']}). Обратитесь к администратору."
-                )
+                await update.message.reply_text(f"📛 Лимит запросов исчерпан ({u['quota']}). Обратитесь к администратору.")
                 return False
         ok, retry = check_rate_limit(user_id)
         if not ok:
-            await update.message.reply_text(
-                f"🐢 Слишком много сообщений. Подождите {retry} секунд."
-            )
+            await update.message.reply_text(f"🐢 Слишком много сообщений. Подождите {retry} секунд.")
             return False
         return True
-
     if is_ignored(user_id):
         await update.message.reply_text("⏳ Ожидайте решения администратора.")
         return False
-
     await notify_admin_request(update, context)
-    await update.message.reply_text(
-        "🔒 У вас пока нет доступа. Администратор получил уведомление и рассмотрит запрос."
-    )
+    await update.message.reply_text("🔒 У вас пока нет доступа. Администратор получил уведомление.")
     return False
 
 async def notify_admin_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -742,7 +825,6 @@ async def notify_admin_request(update: Update, context: ContextTypes.DEFAULT_TYP
         query_text = update.message.text[:200]
     elif update.inline_query and update.inline_query.query:
         query_text = "[inline] " + update.inline_query.query[:200]
-
     text = (
         f"🔔 <b>Новый запрос на доступ</b>\n\n"
         f"ID: <code>{user.id}</code>\n"
@@ -751,15 +833,24 @@ async def notify_admin_request(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Сообщение: {html.escape(query_text)}"
     )
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Разрешить", callback_data=f"allow:{user.id}"),
-            InlineKeyboardButton("🚫 Игнорировать 5 мин", callback_data=f"ignore:{user.id}"),
-        ]
+        [InlineKeyboardButton("✅ Разрешить", callback_data=f"allow:{user.id}"),
+         InlineKeyboardButton("🚫 Игнорировать 5 мин", callback_data=f"ignore:{user.id}")],
     ])
     try:
         await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Не удалось уведомить админа: {e}")
+
+# ─── User locks ──────────────────────────────────────────────────────────────
+
+_user_locks: Dict[int, asyncio.Lock] = {}
+
+def get_user_lock(user_id: int) -> asyncio.Lock:
+    lock = _user_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _user_locks[user_id] = lock
+    return lock
 
 # ─── Commands ────────────────────────────────────────────────────────────────
 
@@ -947,6 +1038,9 @@ async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def callback_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if update.effective_user.id != ADMIN_ID:
+        await query.answer("Недостаточно прав.", show_alert=True)
+        return
     await query.answer()
     data = query.data
     if not data or ":" not in data:
@@ -972,7 +1066,6 @@ async def callback_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     data = query.data
-    user_id = update.effective_user.id
     if data.startswith("rephrase:"):
         prompt = context.user_data.get("last_prompt", "")
         if prompt:
@@ -987,7 +1080,7 @@ async def callback_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ─── Message processing ──────────────────────────────────────────────────────
 
-async def _process_text(
+async def _process_text_locked(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     prompt: str,
@@ -1024,18 +1117,30 @@ async def _process_text(
 
     try:
         result = await ask_gemini(user_id, prompt, model, dialog_id=dialog_id, image_b64=image_b64, doc_text=doc_text)
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error: {e.response.status_code} {e.response.text}")
-        await wait_msg.edit_text(f"❌ Ошибка API: <code>{e.response.status_code}</code>", parse_mode=ParseMode.HTML)
+    except GeminiTimeoutError:
+        logger.warning("Gemini timeout: user=%s model=%s", user_id, model)
+        await wait_msg.edit_text(
+            f"⌛ <b>Gemini не успел ответить.</b>\n\n"
+            f"Сервер не прислал ответ за {GEMINI_READ_TIMEOUT:.0f} секунд.\n"
+            "Попробуйте ещё раз или выберите более быструю модель.",
+            parse_mode=ParseMode.HTML,
+        )
         return
-    except Exception as e:
-        logger.exception("Gemini error")
-        await wait_msg.edit_text(f"❌ Ошибка: <code>{html.escape(str(e))}</code>", parse_mode=ParseMode.HTML)
+    except httpx.HTTPStatusError as exc:
+        logger.error("Gemini HTTP error: status=%s body=%r", exc.response.status_code, exc.response.text[:500])
+        await wait_msg.edit_text(f"❌ Ошибка Gemini API: <code>HTTP {exc.response.status_code}</code>", parse_mode=ParseMode.HTML)
+        return
+    except GeminiRequestError as exc:
+        logger.warning("Gemini request failed: %s", exc)
+        await wait_msg.edit_text(f"❌ Gemini временно недоступен.\n<code>{html.escape(str(exc)[:500])}</code>", parse_mode=ParseMode.HTML)
+        return
+    except Exception:
+        logger.exception("Unexpected Gemini error")
+        await wait_msg.edit_text("❌ Произошла внутренняя ошибка.\nПопробуйте повторить запрос позже.")
         return
 
-    formatted = format_gemini_text(result["text"])
-    chunks = split_message(formatted)
-
+    raw_chunks = split_plain_text(result["text"])
+    chunks = [format_gemini_text(chunk) for chunk in raw_chunks]
     context.user_data["last_prompt"] = prompt
 
     try:
@@ -1044,10 +1149,8 @@ async def _process_text(
         pass
 
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🔄 Перефразируй", callback_data="rephrase:1"),
-            InlineKeyboardButton("💡 Продолжай", callback_data="continue:1"),
-        ],
+        [InlineKeyboardButton("🔄 Перефразируй", callback_data="rephrase:1"),
+         InlineKeyboardButton("💡 Продолжай", callback_data="continue:1")],
         [InlineKeyboardButton("❌ Удалить", callback_data="delete:1")],
     ])
 
@@ -1058,9 +1161,28 @@ async def _process_text(
             )
             if i == len(chunks) - 1:
                 context.user_data["last_bot_message_id"] = msg.message_id
+        except BadRequest as exc:
+            logger.warning("Telegram HTML error: %s", exc)
+            await update.effective_message.reply_text(
+                raw_chunks[i], parse_mode=None, reply_markup=keyboard if i == len(chunks) - 1 else None
+            )
         except Exception as e:
             logger.error(f"Send error: {e}")
-            await update.effective_message.reply_text(_escape(chunk))
+            await update.effective_message.reply_text(html.escape(raw_chunks[i]))
+
+async def _process_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    image_b64: Optional[str] = None,
+    doc_text: Optional[str] = None,
+    edit_msg: Optional[Any] = None,
+) -> None:
+    user = update.effective_user
+    if not user:
+        return
+    async with get_user_lock(user.id):
+        await _process_text_locked(update, context, prompt, image_b64, doc_text, edit_msg)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
@@ -1095,7 +1217,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     file = await doc.get_file()
     bytes_data = await file.download_as_bytearray()
     doc_text = ""
-
     try:
         if mime == "text/plain":
             doc_text = bytes_data.decode("utf-8", errors="replace")[:12000]
@@ -1103,9 +1224,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             try:
                 import PyPDF2
                 reader = PyPDF2.PdfReader(io.BytesIO(bytes_data))
-                parts = []
-                for page in reader.pages[:10]:
-                    parts.append(page.extract_text() or "")
+                parts = [page.extract_text() or "" for page in reader.pages[:10]]
                 doc_text = "\n".join(parts)[:12000]
             except Exception as e:
                 await update.message.reply_text(f"❌ Ошибка чтения PDF: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
@@ -1124,11 +1243,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка обработки файла: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
         return
-
     if not doc_text.strip():
         await update.message.reply_text("📄 Документ пустой или текст не удалось извлечь.")
         return
-
     await _process_text(update, context, prompt, doc_text=doc_text)
 
 # ─── Inline mode ─────────────────────────────────────────────────────────────
@@ -1138,41 +1255,48 @@ WAIT_KEYBOARD = InlineKeyboardMarkup([
 ])
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.inline_query.query
+    inline = update.inline_query
     user = update.effective_user
-    if not user or not query or len(query.strip()) < 2:
+    query = (inline.query or "").strip()
+
+    if not user or len(query) < 2:
+        await inline.answer([], cache_time=1, is_personal=True)
         return
 
     ensure_user(user.id, user.username, user.first_name, allowed=1 if user.id == ADMIN_ID else 0)
 
     if user.id != ADMIN_ID:
-        u = get_user(user.id)
-        if not u or not u["allowed"] or u["blocked"]:
+        db_user = get_user(user.id)
+        if not db_user or not db_user["allowed"] or db_user["blocked"]:
             if not is_ignored(user.id):
                 await notify_admin_request(update, context)
+            await inline.answer([], cache_time=2, is_personal=True)
             return
 
-    title = query.strip()[:50] + "..." if len(query.strip()) > 50 else query.strip()
+    result_id = "gemini:" + hashlib.sha256(f"{user.id}:{query}".encode("utf-8")).hexdigest()[:40]
+    title = query[:50] + "..." if len(query) > 50 else query
     results = [
         InlineQueryResultArticle(
-            id="gemini_inline",
+            id=result_id,
             title=title,
             input_message_content=InputTextMessageContent(
-                f"⏳ <b>Запрос:</b> {html.escape(query.strip()[:200])}\n\n<i>Обрабатываю…</i>",
+                f"⏳ <b>Запрос:</b> {html.escape(query[:200])}\n\n<i>Обрабатываю…</i>",
                 parse_mode=ParseMode.HTML,
             ),
             reply_markup=WAIT_KEYBOARD,
             description="Нажмите, чтобы отправить запрос",
         )
     ]
-    await update.inline_query.answer(results, cache_time=0, is_personal=True)
+    await inline.answer(results, cache_time=0, is_personal=True)
 
 async def callback_ai_wait(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.callback_query.answer("Ответ ещё генерируется…", cache_time=1)
 
 async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chosen = update.chosen_inline_result
-    if not chosen or chosen.result_id != "gemini_inline":
+    if not chosen:
+        return
+    if not (chosen.result_id == "gemini_inline" or chosen.result_id.startswith("gemini:")):
         return
 
     query_text = chosen.query.strip()
@@ -1186,7 +1310,6 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
         if not u or not u["allowed"] or u["blocked"]:
             return
 
-    # Получаем настройки пользователя для инлайна
     u = get_user(user_id)
     inline_model = (u.get("inline_model") or INLINE_MODEL) if u else INLINE_MODEL
     inline_prompt = u.get("inline_prompt") if u else None
@@ -1198,15 +1321,25 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
             formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
         full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}"
         usage = result.get("usage", {})
-        update_stats(user_id, usage.get("prompt_tokens", 0) * 4, usage.get("completion_tokens", 0) * 4)
-    except httpx.ReadTimeout:
-        logger.error("Inline: Gemini timeout")
-        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка: таймаут. Gemini слишком долго думает. Попробуйте позже."
-    except httpx.HTTPStatusError as e:
-        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка API: <code>{e.response.status_code}</code>"
-    except Exception as e:
-        logger.exception("Inline Gemini error")
-        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка: <code>{html.escape(str(e))}</code>"
+        pt = usage.get("prompt_tokens")
+        if pt is None:
+            pt = max(1, len(query_text) // 4)
+        ct = usage.get("completion_tokens")
+        if ct is None:
+            ct = max(1, len(result["text"]) // 4)
+        await asyncio.to_thread(update_stats, user_id, pt, ct)
+    except GeminiTimeoutError:
+        logger.warning("Inline Gemini timeout: user=%s model=%s", user_id, inline_model)
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n⌛ Gemini не успел ответить. Попробуйте ещё раз или выберите более быструю модель."
+    except httpx.HTTPStatusError as exc:
+        logger.error("Inline Gemini HTTP error: %s %r", exc.response.status_code, exc.response.text[:500])
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка Gemini API: <code>HTTP {exc.response.status_code}</code>"
+    except GeminiRequestError as exc:
+        logger.warning("Inline Gemini error: %s", exc)
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Gemini временно недоступен."
+    except Exception:
+        logger.exception("Unexpected inline Gemini error")
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Произошла внутренняя ошибка."
 
     if inline_message_id:
         try:
@@ -1230,8 +1363,7 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
             logger.error(f"Inline PM fallback failed: {e}")
 
 async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    import asyncio
-    asyncio.create_task(_process_inline_chosen(update, context))
+    context.application.create_task(_process_inline_chosen(update, context), update=update)
 
 # ─── Admin commands ──────────────────────────────────────────────────────────
 
@@ -1253,8 +1385,8 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"квота: {r['quota']} | запросов: {r['requests']} | токенов: {r['tokens_prompt'] + r['tokens_completion']}"
         )
     text = "\n".join(lines)
-    for chunk in split_message(text):
-        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+    for chunk in split_plain_text(text, max_len=3500):
+        await update.message.reply_text(format_gemini_text(chunk), parse_mode=ParseMode.HTML)
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
@@ -1268,8 +1400,8 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             status = "заблокирован"
         lines.append(f"• <code>{r['user_id']}</code> | @{html.escape(name)} | {status} | квота: {r['quota']}")
     text = "\n".join(lines)
-    for chunk in split_message(text):
-        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+    for chunk in split_plain_text(text, max_len=3500):
+        await update.message.reply_text(format_gemini_text(chunk), parse_mode=ParseMode.HTML)
 
 async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
@@ -1349,14 +1481,22 @@ async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ─── Backup job ──────────────────────────────────────────────────────────────
 
+def create_sqlite_backup(destination: str) -> None:
+    source = _conn()
+    target = sqlite3.connect(destination)
+    try:
+        source.backup(target)
+    finally:
+        target.close()
+        source.close()
+
 async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         os.makedirs("/app/data/backups", exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        src = "/app/data/bot.db"
         dst = f"/app/data/backups/bot_{ts}.db"
-        if os.path.exists(src):
-            shutil.copy2(src, dst)
+        if os.path.exists(DB_PATH):
+            await asyncio.to_thread(create_sqlite_backup, dst)
             files = sorted(
                 [f for f in os.listdir("/app/data/backups") if f.startswith("bot_")],
                 key=lambda x: os.path.getmtime(os.path.join("/app/data/backups", x)),
@@ -1384,9 +1524,15 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 def main() -> None:
     init_db()
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(TELEGRAM_CONCURRENT_UPDATES)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
-    # commands
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("new", cmd_new))
@@ -1404,7 +1550,6 @@ def main() -> None:
     application.add_handler(CommandHandler("setquota", cmd_setquota))
     application.add_handler(CommandHandler("setrate", cmd_setrate))
 
-    # callbacks
     application.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(callback_role, pattern=r"^role:"))
     application.add_handler(CallbackQueryHandler(callback_inlinemodel, pattern=r"^inlinemodel:"))
@@ -1413,19 +1558,14 @@ def main() -> None:
     application.add_handler(CallbackQueryHandler(callback_actions, pattern=r"^(rephrase|continue|delete):"))
     application.add_handler(CallbackQueryHandler(callback_ai_wait, pattern=r"^ai_wait$"))
 
-    # inline
     application.add_handler(InlineQueryHandler(inline_query))
     application.add_handler(ChosenInlineResultHandler(chosen_inline_result))
 
-    # messages
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # errors
     application.add_error_handler(error_handler)
-
-    # backup job at 04:00
     application.job_queue.run_daily(backup_job, time=dt_time(hour=4, minute=0))
 
     logger.info("Бот запущен. Ожидаю сообщения...")
