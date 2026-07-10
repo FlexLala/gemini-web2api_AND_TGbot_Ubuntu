@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 r"""
-Gemini Telegram Bot
-- Работает через локальный gemini-web2api (Германия -> Gemini)
-- Доступ только по разрешению админа
-- LaTeX-safe HTML форматирование
-- Инлайн-режим (только экономная модель)
-- Админ-статистика без чтения запросов
+Gemini Telegram Bot v2
+- Локальный gemini-web2api (Германия -> Gemini)
+- Доступ по заявке, квоты, rate-limit
+- Система диалогов (до 30)
+- LaTeX-safe HTML, роли, кнопки
+- Мультимодал: фото + документы
+- Инлайн через chosen_inline_result (экономия токенов)
 """
 
 import os
@@ -16,7 +17,10 @@ import re
 import json
 import time
 import logging
-from datetime import datetime
+import shutil
+import base64
+import io
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 import httpx
@@ -34,6 +38,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     InlineQueryHandler,
+    ChosenInlineResultHandler,
     ContextTypes,
     filters,
 )
@@ -46,8 +51,8 @@ GEMINI_API_URL = os.getenv("GEMINI_API_URL", "http://gemini-api:8081/v1/chat/com
 INLINE_MODEL = os.getenv("INLINE_MODEL", "gemini-3.5-flash").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-3.5-flash").strip()
 API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-MAX_HISTORY = 20  # сообщений (10 пар)
-IGNORE_TTL_SEC = 300  # 5 минут
+MAX_DIALOGS = 30
+IGNORE_TTL_SEC = 300
 
 if not BOT_TOKEN:
     raise SystemExit("TELEGRAM_BOT_TOKEN не задан в .env")
@@ -73,6 +78,7 @@ def _conn() -> sqlite3.Connection:
 def init_db() -> None:
     conn = _conn()
     c = conn.cursor()
+    # users
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -80,18 +86,40 @@ def init_db() -> None:
             first_name TEXT,
             allowed INTEGER DEFAULT 0,
             blocked INTEGER DEFAULT 0,
+            quota INTEGER DEFAULT 100,
+            system_role TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # migrations for old dbs
+    for col, dtype in [("quota", "INTEGER DEFAULT 100"), ("system_role", "TEXT")]:
+        try:
+            c.execute(f"ALTER TABLE users ADD COLUMN {col} {dtype}")
+        except sqlite3.OperationalError:
+            pass  # already exists
+    # dialogs
     c.execute("""
-        CREATE TABLE IF NOT EXISTS conversations (
+        CREATE TABLE IF NOT EXISTS dialogs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
+            title TEXT,
+            token_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            active INTEGER DEFAULT 0
+        )
+    """)
+    # messages inside dialogs
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS dialog_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dialog_id INTEGER,
             role TEXT,
             content TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # stats
     c.execute("""
         CREATE TABLE IF NOT EXISTS stats (
             user_id INTEGER PRIMARY KEY,
@@ -101,8 +129,53 @@ def init_db() -> None:
             last_used TIMESTAMP
         )
     """)
+    # rate limit log
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS rate_limit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            timestamp REAL
+        )
+    """)
+    # settings
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    # defaults
+    defaults = [
+        ("rate_limit_messages", "5"),
+        ("rate_limit_window", "60"),
+        ("rate_limit_ignore", "600"),
+    ]
+    for k, v in defaults:
+        c.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)", (k, v))
     conn.commit()
     conn.close()
+
+# ─── Settings helpers ────────────────────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+def set_setting(key: str, value: str) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO bot_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+# ─── User helpers ────────────────────────────────────────────────────────────
 
 def ensure_user(user_id: int, username: Optional[str], first_name: Optional[str], allowed: int = 0) -> None:
     conn = _conn()
@@ -128,16 +201,13 @@ def ensure_user(user_id: int, username: Optional[str], first_name: Optional[str]
 def get_user(user_id: int) -> Optional[Dict[str, Any]]:
     conn = _conn()
     c = conn.cursor()
-    c.execute("SELECT user_id, username, first_name, allowed, blocked FROM users WHERE user_id = ?", (user_id,))
+    c.execute("SELECT user_id, username, first_name, allowed, blocked, quota, system_role FROM users WHERE user_id = ?", (user_id,))
     row = c.fetchone()
     conn.close()
     if row:
         return {
-            "user_id": row[0],
-            "username": row[1],
-            "first_name": row[2],
-            "allowed": row[3],
-            "blocked": row[4],
+            "user_id": row[0], "username": row[1], "first_name": row[2],
+            "allowed": row[3], "blocked": row[4], "quota": row[5], "system_role": row[6],
         }
     return None
 
@@ -155,42 +225,132 @@ def set_blocked(user_id: int, blocked: int) -> None:
     conn.commit()
     conn.close()
 
-def get_history(user_id: int) -> List[Dict[str, str]]:
+def set_quota(user_id: int, quota: int) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET quota = ? WHERE user_id = ?", (quota, user_id))
+    conn.commit()
+    conn.close()
+
+def set_system_role(user_id: int, role: Optional[str]) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("UPDATE users SET system_role = ? WHERE user_id = ?", (role, user_id))
+    conn.commit()
+    conn.close()
+
+# ─── Dialog helpers ──────────────────────────────────────────────────────────
+
+def get_active_dialog(user_id: int) -> Optional[Dict[str, Any]]:
     conn = _conn()
     c = conn.cursor()
     c.execute(
-        "SELECT role, content FROM conversations WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-        (user_id, MAX_HISTORY),
+        "SELECT id, title, token_count, created_at, updated_at FROM dialogs WHERE user_id = ? AND active = 1 ORDER BY updated_at DESC LIMIT 1",
+        (user_id,),
+    )
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"id": row[0], "title": row[1], "token_count": row[2], "created_at": row[3], "updated_at": row[4]}
+    return None
+
+def create_dialog(user_id: int, title: str) -> int:
+    conn = _conn()
+    c = conn.cursor()
+    # deactivate others
+    c.execute("UPDATE dialogs SET active = 0 WHERE user_id = ?", (user_id,))
+    c.execute(
+        "INSERT INTO dialogs (user_id, title, active) VALUES (?, ?, 1)",
+        (user_id, title),
+    )
+    dialog_id = c.lastrowid
+    # keep only MAX_DIALOGS
+    c.execute(
+        "SELECT id FROM dialogs WHERE user_id = ? ORDER BY updated_at DESC LIMIT -1 OFFSET ?",
+        (user_id, MAX_DIALOGS),
+    )
+    for old in c.fetchall():
+        c.execute("DELETE FROM dialog_messages WHERE dialog_id = ?", (old[0],))
+        c.execute("DELETE FROM dialogs WHERE id = ?", (old[0],))
+    conn.commit()
+    conn.close()
+    return dialog_id
+
+def switch_dialog(user_id: int, dialog_id: int) -> bool:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM dialogs WHERE id = ? AND user_id = ?", (dialog_id, user_id))
+    if not c.fetchone():
+        conn.close()
+        return False
+    c.execute("UPDATE dialogs SET active = 0 WHERE user_id = ?", (user_id,))
+    c.execute("UPDATE dialogs SET active = 1 WHERE id = ?", (dialog_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_dialogs(user_id: int) -> List[Dict[str, Any]]:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT id, title, token_count, updated_at, active FROM dialogs WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?",
+        (user_id, MAX_DIALOGS),
+    )
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "title": r[1], "token_count": r[2], "updated_at": r[3], "active": r[4]}
+        for r in rows
+    ]
+
+def get_dialog_history(dialog_id: int, limit: int = 40) -> List[Dict[str, str]]:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute(
+        "SELECT role, content FROM dialog_messages WHERE dialog_id = ? ORDER BY id DESC LIMIT ?",
+        (dialog_id, limit),
     )
     rows = c.fetchall()
     conn.close()
     rows.reverse()
     return [{"role": r, "content": c} for r, c in rows]
 
-def add_message(user_id: int, role: str, content: str) -> None:
+def add_dialog_message(dialog_id: int, role: str, content: str, max_msgs: int = 50) -> None:
     conn = _conn()
     c = conn.cursor()
     c.execute(
-        "INSERT INTO conversations (user_id, role, content) VALUES (?, ?, ?)",
-        (user_id, role, content),
+        "INSERT INTO dialog_messages (dialog_id, role, content) VALUES (?, ?, ?)",
+        (dialog_id, role, content),
     )
     c.execute(
         """
-        DELETE FROM conversations WHERE id IN (
-            SELECT id FROM conversations WHERE user_id = ? ORDER BY id DESC LIMIT -1 OFFSET ?
+        DELETE FROM dialog_messages WHERE id IN (
+            SELECT id FROM dialog_messages WHERE dialog_id = ? ORDER BY id DESC LIMIT -1 OFFSET ?
         )
         """,
-        (user_id, MAX_HISTORY),
+        (dialog_id, max_msgs),
     )
     conn.commit()
     conn.close()
 
-def clear_history(user_id: int) -> None:
+def update_dialog_meta(dialog_id: int, token_delta: int) -> None:
     conn = _conn()
     c = conn.cursor()
-    c.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+    c.execute(
+        "UPDATE dialogs SET token_count = token_count + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (token_delta, dialog_id),
+    )
     conn.commit()
     conn.close()
+
+def update_dialog_title(dialog_id: int, title: str) -> None:
+    conn = _conn()
+    c = conn.cursor()
+    c.execute("UPDATE dialogs SET title = ? WHERE id = ?", (title, dialog_id))
+    conn.commit()
+    conn.close()
+
+# ─── Stats ───────────────────────────────────────────────────────────────────
 
 def update_stats(user_id: int, prompt_len: int, completion_len: int) -> None:
     conn = _conn()
@@ -214,7 +374,7 @@ def get_all_stats() -> List[Dict[str, Any]]:
     conn = _conn()
     c = conn.cursor()
     c.execute("""
-        SELECT u.user_id, u.username, u.first_name, u.allowed, u.blocked,
+        SELECT u.user_id, u.username, u.first_name, u.allowed, u.blocked, u.quota,
                COALESCE(s.requests, 0), COALESCE(s.tokens_prompt, 0), COALESCE(s.tokens_completion, 0)
         FROM users u
         LEFT JOIN stats s ON u.user_id = s.user_id
@@ -224,19 +384,42 @@ def get_all_stats() -> List[Dict[str, Any]]:
     conn.close()
     return [
         {
-            "user_id": r[0],
-            "username": r[1],
-            "first_name": r[2],
-            "allowed": r[3],
-            "blocked": r[4],
-            "requests": r[5],
-            "tokens_prompt": r[6],
-            "tokens_completion": r[7],
+            "user_id": r[0], "username": r[1], "first_name": r[2],
+            "allowed": r[3], "blocked": r[4], "quota": r[5],
+            "requests": r[6], "tokens_prompt": r[7], "tokens_completion": r[8],
         }
         for r in rows
     ]
 
-# ─── Ignore list (in-memory, 5 min TTL) ──────────────────────────────────────
+# ─── Rate limit ──────────────────────────────────────────────────────────────
+
+def check_rate_limit(user_id: int) -> tuple:
+    """Returns (allowed: bool, retry_after: int)"""
+    if user_id == ADMIN_ID:
+        return True, 0
+    msgs = int(get_setting("rate_limit_messages", "5"))
+    window = int(get_setting("rate_limit_window", "60"))
+    ignore_dur = int(get_setting("rate_limit_ignore", "600"))
+    now = time.time()
+    conn = _conn()
+    c = conn.cursor()
+    # clean old
+    c.execute("DELETE FROM rate_limit_log WHERE timestamp < ?", (now - window,))
+    # count recent
+    c.execute("SELECT COUNT(*) FROM rate_limit_log WHERE user_id = ? AND timestamp > ?", (user_id, now - window))
+    count = c.fetchone()[0]
+    if count >= msgs:
+        # add ignore
+        add_ignore_custom(user_id, ignore_dur)
+        conn.commit()
+        conn.close()
+        return False, ignore_dur
+    c.execute("INSERT INTO rate_limit_log (user_id, timestamp) VALUES (?, ?)", (user_id, now))
+    conn.commit()
+    conn.close()
+    return True, 0
+
+# ─── Ignore list ─────────────────────────────────────────────────────────────
 
 _ignore_cache: Dict[int, float] = {}
 
@@ -251,6 +434,20 @@ def is_ignored(user_id: int) -> bool:
 def add_ignore(user_id: int) -> None:
     _ignore_cache[user_id] = time.time()
 
+def add_ignore_custom(user_id: int, seconds: int) -> None:
+    _ignore_cache[user_id] = time.time() + seconds - IGNORE_TTL_SEC
+
+# ─── Roles ───────────────────────────────────────────────────────────────────
+
+ROLES = {
+    "default": "",
+    "programmer": "Ты senior-разработчик. Пиши чистый, современный код с пояснениями. Используй best practices.",
+    "translator": "Ты профессиональный переводчик. Переводи точно, сохраняя стиль и контекст оригинала.",
+    "teacher": "Ты терпеливый учитель. Объясняй сложные вещи простым языком, с примерами.",
+    "concise": "Отвечай максимально кратко и по делу. Без воды и лишних вступлений.",
+    "creative": "Ты креативный помощник. Предлагай нестандартные идеи и яркие формулировки.",
+}
+
 # ─── LaTeX / HTML formatting ─────────────────────────────────────────────────
 
 def _escape(text: str) -> str:
@@ -263,7 +460,6 @@ def format_gemini_text(raw: str) -> str:
     - Экранирует HTML
     - Оборачивает LaTeX \(...\), \[...\], $...$, $$...$$ в code/pre
     """
-    # 1. Вырезаем thinking
     thinking_html = ""
     m = re.search(r'<thinking>(.*?)</thinking>', raw, re.DOTALL)
     text = raw
@@ -276,10 +472,8 @@ def format_gemini_text(raw: str) -> str:
                 f'{_escape(thinking)}</blockquote>\n\n'
             )
 
-    # 2. Разбиваем текст на сегменты: plain / latex
     parts: List[str] = []
     last_end = 0
-    # Группы: 2=\(...\), 3=\[...\], 4=$...$, 5=$$...$$
     pattern = re.compile(
         r'(\\\((.*?)\\\)|\\\[(.*?)\\\]|(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)|\$\$(.*?)\$\$)',
         re.DOTALL,
@@ -322,7 +516,6 @@ def split_message(text: str, max_len: int = 4000) -> List[str]:
             current += para
     if current:
         chunks.append(current.rstrip())
-    # Если абзацы слишком длинные, режем по строкам
     final = []
     for ch in chunks:
         if len(ch) <= max_len:
@@ -339,6 +532,11 @@ def split_message(text: str, max_len: int = 4000) -> List[str]:
             final.append(sub)
     return final
 
+def make_title_from_text(text: str) -> str:
+    words = text.strip().split()
+    title = " ".join(words[:8])[:60]
+    return title or "Новый диалог"
+
 # ─── Gemini API client ───────────────────────────────────────────────────────
 
 HEADERS = {"Content-Type": "application/json"}
@@ -349,12 +547,33 @@ async def ask_gemini(
     user_id: int,
     prompt: str,
     model: str,
-    with_history: bool = True,
+    dialog_id: Optional[int] = None,
+    image_b64: Optional[str] = None,
+    doc_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     messages = []
-    if with_history:
-        messages = get_history(user_id)
-    messages.append({"role": "user", "content": prompt})
+    # system role
+    u = get_user(user_id)
+    if u and u.get("system_role"):
+        role_text = ROLES.get(u["system_role"], "")
+        if role_text:
+            messages.append({"role": "system", "content": role_text})
+
+    # history
+    if dialog_id:
+        messages.extend(get_dialog_history(dialog_id, limit=40))
+
+    # build user content
+    content: Any = prompt
+    if doc_text:
+        content = f"{prompt}\n\n[Содержимое документа]:\n{doc_text}"
+    if image_b64:
+        content = [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]
+
+    messages.append({"role": "user", "content": content})
 
     payload = {
         "model": model,
@@ -367,19 +586,20 @@ async def ask_gemini(
         resp.raise_for_status()
         data = resp.json()
 
-    # Проверка ошибок от gemini-web2api
     if "error" in data:
         raise RuntimeError(data["error"].get("message", "Unknown API error"))
 
     choice = data.get("choices", [{}])[0]
     answer = choice.get("message", {}).get("content") or "(пустой ответ)"
 
-    # Сохраняем историю
-    if with_history:
-        add_message(user_id, "user", prompt)
-        add_message(user_id, "assistant", answer)
+    # save to dialog
+    if dialog_id:
+        add_dialog_message(dialog_id, "user", prompt if not doc_text else f"{prompt} [+документ]")
+        add_dialog_message(dialog_id, "assistant", answer)
+        usage = data.get("usage", {})
+        update_dialog_meta(dialog_id, (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)))
 
-    # Статистика
+    # stats
     usage = data.get("usage", {})
     update_stats(
         user_id,
@@ -395,12 +615,8 @@ async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
     if not user:
         return False
-
     user_id = user.id
-    username = user.username
-    first_name = user.first_name
-
-    ensure_user(user_id, username, first_name, allowed=1 if user_id == ADMIN_ID else 0)
+    ensure_user(user_id, user.username, user.first_name, allowed=1 if user_id == ADMIN_ID else 0)
 
     if user_id == ADMIN_ID:
         return True
@@ -410,13 +626,32 @@ async def require_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("⛔ Доступ заблокирован.")
         return False
     if u and u["allowed"]:
+        # check quota
+        if u["quota"] > 0:
+            conn = _conn()
+            c = conn.cursor()
+            c.execute("SELECT requests FROM stats WHERE user_id = ?", (user_id,))
+            row = c.fetchone()
+            conn.close()
+            used = row[0] if row else 0
+            if used >= u["quota"]:
+                await update.message.reply_text(
+                    f"📛 Лимит запросов исчерпан ({u['quota']}). Обратитесь к администратору."
+                )
+                return False
+        # rate limit
+        ok, retry = check_rate_limit(user_id)
+        if not ok:
+            await update.message.reply_text(
+                f"🐢 Слишком много сообщений. Подождите {retry} секунд."
+            )
+            return False
         return True
 
     if is_ignored(user_id):
         await update.message.reply_text("⏳ Ожидайте решения администратора.")
         return False
 
-    # Уведомляем админа
     await notify_admin_request(update, context)
     await update.message.reply_text(
         "🔒 У вас пока нет доступа. Администратор получил уведомление и рассмотрит запрос."
@@ -449,39 +684,65 @@ async def notify_admin_request(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logger.error(f"Не удалось уведомить админа: {e}")
 
-# ─── Handlers ────────────────────────────────────────────────────────────────
+# ─── Commands ────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     ensure_user(user.id, user.username, user.first_name, allowed=1 if user.id == ADMIN_ID else 0)
-
     text = (
         "👋 <b>Привет!</b>\n\n"
         "Я бот для Gemini через локальный API (Германия -> Gemini).\n\n"
         "<b>Команды:</b>\n"
+        "/new — новый диалог\n"
+        "/dialog — мои диалоги\n"
         "/model — выбрать модель\n"
-        "/clear — очистить историю диалога\n"
+        "/role — выбрать роль\n"
+        "/clear — очистить активный диалог\n"
         "/help — справка\n"
     )
     if user.id == ADMIN_ID:
         text += (
             "\n<b>Админ-команды:</b>\n"
-            "/stats — статистика по пользователям\n"
+            "/stats — статистика\n"
             "/users — список пользователей\n"
-            "/allow &lt;id&gt; — разрешить пользователя\n"
-            "/block &lt;id&gt; — заблокировать пользователя\n"
+            "/allow &lt;id&gt; — разрешить\n"
+            "/block &lt;id&gt; — заблокировать\n"
+            "/setquota &lt;id&gt; &lt;n&gt; — квота\n"
+            "/setrate &lt;msg&gt; &lt;win&gt; &lt;ign&gt; — антиспам\n"
         )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_start(update, context)
 
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    dialog_id = create_dialog(update.effective_user.id, "Новый диалог")
+    await update.message.reply_text(f"✅ Создан новый диалог <code>#{dialog_id}</code>. Старые сообщения не пропали — они в /dialog.", parse_mode=ParseMode.HTML)
+
+async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    user_id = update.effective_user.id
+    dialogs = get_dialogs(user_id)
+    if not dialogs:
+        await update.message.reply_text("У вас пока нет диалогов. Начните с /new")
+        return
+    lines = ["<b>📁 Ваши диалоги</b>\n"]
+    buttons = []
+    for d in dialogs:
+        active = " ✓" if d["active"] else ""
+        lines.append(f"{d['id']}. {html.escape(d['title'])} (≈{d['token_count']} токенов){active}")
+        buttons.append([InlineKeyboardButton(f"#{d['id']} {d['title'][:30]}", callback_data=f"switch:{d['id']}")])
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
         return
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ Gemini 3.5 Flash (быстрый)", callback_data="model:gemini-3.5-flash")],
-        [InlineKeyboardButton("🧠 Gemini 3.5 Flash Thinking (глубокий)", callback_data="model:gemini-3.5-flash-thinking")],
+        [InlineKeyboardButton("⚡ Gemini 3.5 Flash", callback_data="model:gemini-3.5-flash")],
+        [InlineKeyboardButton("🧠 Flash Thinking", callback_data="model:gemini-3.5-flash-thinking")],
         [InlineKeyboardButton("🔬 Gemini 3.1 Pro", callback_data="model:gemini-3.1-pro")],
         [InlineKeyboardButton("🎯 Gemini Auto", callback_data="model:gemini-auto")],
         [InlineKeyboardButton("💡 Flash Thinking Lite", callback_data="model:gemini-3.5-flash-thinking-lite")],
@@ -489,11 +750,35 @@ async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ])
     await update.message.reply_text("Выберите модель:", reply_markup=keyboard)
 
+async def cmd_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обычный", callback_data="role:default")],
+        [InlineKeyboardButton("💻 Программист", callback_data="role:programmer")],
+        [InlineKeyboardButton("🌐 Переводчик", callback_data="role:translator")],
+        [InlineKeyboardButton("📚 Учитель", callback_data="role:teacher")],
+        [InlineKeyboardButton("✂️ Кратко", callback_data="role:concise")],
+        [InlineKeyboardButton("🎨 Креатив", callback_data="role:creative")],
+    ])
+    await update.message.reply_text("Выберите роль бота:", reply_markup=keyboard)
+
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
         return
-    clear_history(update.effective_user.id)
-    await update.message.reply_text("🗑 История диалога очищена.")
+    dialog = get_active_dialog(update.effective_user.id)
+    if dialog:
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("DELETE FROM dialog_messages WHERE dialog_id = ?", (dialog["id"],))
+        c.execute("UPDATE dialogs SET token_count = 0 WHERE id = ?", (dialog["id"],))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text("🗑 История активного диалога очищена.")
+    else:
+        await update.message.reply_text("Нет активного диалога. Создайте /new")
+
+# ─── Callbacks ───────────────────────────────────────────────────────────────
 
 async def callback_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -502,7 +787,28 @@ async def callback_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if data.startswith("model:"):
         model = data.split(":", 1)[1]
         context.user_data["model"] = model
-        await query.edit_message_text(f"✅ Модель установлена: <code>{html.escape(model)}</code>", parse_mode=ParseMode.HTML)
+        await query.edit_message_text(f"✅ Модель: <code>{html.escape(model)}</code>", parse_mode=ParseMode.HTML)
+
+async def callback_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("role:"):
+        role = data.split(":", 1)[1]
+        set_system_role(update.effective_user.id, role if role != "default" else None)
+        name = {"programmer": "💻 Программист", "translator": "🌐 Переводчик", "teacher": "📚 Учитель", "concise": "✂️ Кратко", "creative": "🎨 Креатив"}.get(role, "🔄 Обычный")
+        await query.edit_message_text(f"✅ Роль: {name}", parse_mode=ParseMode.HTML)
+
+async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("switch:"):
+        dialog_id = int(data.split(":", 1)[1])
+        if switch_dialog(update.effective_user.id, dialog_id):
+            await query.edit_message_text(f"✅ Переключено на диалог <code>#{dialog_id}</code>", parse_mode=ParseMode.HTML)
+        else:
+            await query.answer("Ошибка переключения", show_alert=True)
 
 async def callback_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -515,37 +821,79 @@ async def callback_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user_id = int(user_id_str)
     except ValueError:
         return
-
     if action == "allow":
         set_allowed(user_id, 1)
         set_blocked(user_id, 0)
         await query.edit_message_text(f"✅ Доступ разрешён для <code>{user_id}</code>", parse_mode=ParseMode.HTML)
         try:
-            await context.bot.send_message(chat_id=user_id, text="🎉 Администратор разрешил вам доступ! Можете начинать.")
+            await context.bot.send_message(chat_id=user_id, text="🎉 Администратор разрешил вам доступ!")
         except Exception:
             pass
     elif action == "ignore":
         add_ignore(user_id)
         await query.edit_message_text(f"🚫 Запрос от <code>{user_id}</code> проигнорирован на 5 минут.", parse_mode=ParseMode.HTML)
 
-# ─── Message handler ─────────────────────────────────────────────────────────
+async def callback_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+    if data.startswith("rephrase:"):
+        prompt = context.user_data.get("last_prompt", "")
+        if prompt:
+            await _process_text(update, context, f"Перефразируй иначе: {prompt}", edit_msg=query.message)
+    elif data.startswith("continue:"):
+        await _process_text(update, context, "Продолжай", edit_msg=query.message)
+    elif data.startswith("delete:"):
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_access(update, context):
-        return
+# ─── Message processing ──────────────────────────────────────────────────────
+
+async def _process_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    image_b64: Optional[str] = None,
+    doc_text: Optional[str] = None,
+    edit_msg: Optional[Any] = None,
+) -> None:
     user = update.effective_user
-    prompt = update.message.text
-    if not prompt:
-        return
-
+    user_id = user.id
     model = context.user_data.get("model", DEFAULT_MODEL)
-    wait_msg = await update.message.reply_text("⏳ Думаю...")
+
+    # ensure active dialog
+    dialog = get_active_dialog(user_id)
+    if not dialog:
+        dialog_id = create_dialog(user_id, make_title_from_text(prompt))
+    else:
+        dialog_id = dialog["id"]
+        # update title if empty/default and this is first user message
+        conn = _conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM dialog_messages WHERE dialog_id = ?", (dialog_id,))
+        cnt = c.fetchone()[0]
+        conn.close()
+        if cnt == 0 and dialog.get("title") in (None, "", "Новый диалог"):
+            update_dialog_title(dialog_id, make_title_from_text(prompt))
+
+    wait_msg = None
+    if edit_msg:
+        try:
+            await edit_msg.edit_text("⏳ Думаю...")
+            wait_msg = edit_msg
+        except Exception:
+            wait_msg = await update.effective_message.reply_text("⏳ Думаю...")
+    else:
+        wait_msg = await update.effective_message.reply_text("⏳ Думаю...")
 
     try:
-        result = await ask_gemini(user.id, prompt, model, with_history=True)
+        result = await ask_gemini(user_id, prompt, model, dialog_id=dialog_id, image_b64=image_b64, doc_text=doc_text)
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error: {e.response.status_code} {e.response.text}")
-        await wait_msg.edit_text(f"❌ Ошибка соединения с API: <code>{e.response.status_code}</code> Bad Gateway / Upstream error", parse_mode=ParseMode.HTML)
+        await wait_msg.edit_text(f"❌ Ошибка API: <code>{e.response.status_code}</code>", parse_mode=ParseMode.HTML)
         return
     except Exception as e:
         logger.exception("Gemini error")
@@ -555,18 +903,167 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     formatted = format_gemini_text(result["text"])
     chunks = split_message(formatted)
 
+    # store for buttons
+    context.user_data["last_prompt"] = prompt
+
     try:
         await wait_msg.delete()
     except Exception:
         pass
 
-    for chunk in chunks:
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Перефразируй", callback_data="rephrase:1"),
+            InlineKeyboardButton("💡 Продолжай", callback_data="continue:1"),
+        ],
+        [InlineKeyboardButton("❌ Удалить", callback_data="delete:1")],
+    ])
+
+    for i, chunk in enumerate(chunks):
         try:
-            await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+            msg = await update.effective_message.reply_text(
+                chunk, parse_mode=ParseMode.HTML, reply_markup=keyboard if i == len(chunks) - 1 else None
+            )
+            if i == len(chunks) - 1:
+                context.user_data["last_bot_message_id"] = msg.message_id
         except Exception as e:
             logger.error(f"Send error: {e}")
-            # Fallback: отправляем как plain text
-            await update.message.reply_text(_escape(chunk))
+            await update.effective_message.reply_text(_escape(chunk))
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    prompt = update.message.text
+    if not prompt:
+        return
+    await _process_text(update, context, prompt)
+
+# ─── Photo handler ───────────────────────────────────────────────────────────
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    prompt = update.message.caption or "Опиши эту картинку"
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    bytes_data = await file.download_as_bytearray()
+    b64 = base64.b64encode(bytes_data).decode()
+    await _process_text(update, context, prompt, image_b64=b64)
+
+# ─── Document handler ────────────────────────────────────────────────────────
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    doc = update.message.document
+    if not doc:
+        return
+    mime = doc.mime_type or ""
+    prompt = update.message.caption or "Расскажи о содержании этого документа"
+    file = await doc.get_file()
+    bytes_data = await file.download_as_bytearray()
+    doc_text = ""
+
+    try:
+        if mime == "text/plain":
+            doc_text = bytes_data.decode("utf-8", errors="replace")[:12000]
+        elif mime == "application/pdf":
+            try:
+                import PyPDF2
+                reader = PyPDF2.PdfReader(io.BytesIO(bytes_data))
+                parts = []
+                for page in reader.pages[:10]:
+                    parts.append(page.extract_text() or "")
+                doc_text = "\n".join(parts)[:12000]
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка чтения PDF: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+                return
+        elif mime in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",):
+            try:
+                import docx
+                d = docx.Document(io.BytesIO(bytes_data))
+                doc_text = "\n".join([p.text for p in d.paragraphs])[:12000]
+            except Exception as e:
+                await update.message.reply_text(f"❌ Ошибка чтения DOCX: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+                return
+        else:
+            await update.message.reply_text("📄 Поддерживаются только .txt, .pdf, .docx")
+            return
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка обработки файла: {html.escape(str(e))}", parse_mode=ParseMode.HTML)
+        return
+
+    if not doc_text.strip():
+        await update.message.reply_text("📄 Документ пустой или текст не удалось извлечь.")
+        return
+
+    await _process_text(update, context, prompt, doc_text=doc_text)
+
+# ─── Inline mode (fixed) ─────────────────────────────────────────────────────
+
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.inline_query.query
+    user = update.effective_user
+    if not user or not query or len(query.strip()) < 2:
+        return
+
+    ensure_user(user.id, user.username, user.first_name, allowed=1 if user.id == ADMIN_ID else 0)
+
+    if user.id != ADMIN_ID:
+        u = get_user(user.id)
+        if not u or not u["allowed"] or u["blocked"]:
+            if not is_ignored(user.id):
+                await notify_admin_request(update, context)
+            return
+
+    title = query.strip()[:50] + "..." if len(query.strip()) > 50 else query.strip()
+    results = [
+        InlineQueryResultArticle(
+            id="gemini_inline",
+            title=title,
+            input_message_content=InputTextMessageContent(
+                f"⏳ <b>Запрос:</b> {html.escape(query.strip()[:200])}\n\n<i>Обрабатываю...</i>",
+                parse_mode=ParseMode.HTML,
+            ),
+            description="Нажмите, чтобы получить ответ",
+        )
+    ]
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
+
+async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chosen = update.chosen_inline_result
+    if not chosen or chosen.result_id != "gemini_inline":
+        return
+    query_text = chosen.query
+    user_id = chosen.from_user.id
+    inline_message_id = chosen.inline_message_id
+
+    if not inline_message_id:
+        return
+
+    if user_id != ADMIN_ID:
+        u = get_user(user_id)
+        if not u or not u["allowed"] or u["blocked"]:
+            return
+
+    try:
+        result = await ask_gemini(user_id, query_text, INLINE_MODEL, dialog_id=None)
+        formatted = format_gemini_text(result["text"])
+        if len(formatted) > 4000:
+            formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
+    except httpx.HTTPStatusError as e:
+        formatted = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
+    except Exception as e:
+        formatted = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
+
+    try:
+        await context.bot.edit_message_text(
+            text=f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}",
+            inline_message_id=inline_message_id,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.error(f"Edit inline message failed: {e}")
 
 # ─── Admin commands ──────────────────────────────────────────────────────────
 
@@ -585,7 +1082,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             status = "⛔"
         lines.append(
             f"{status} <code>{r['user_id']}</code> | @{html.escape(name)} | "
-            f"запросов: {r['requests']} | токенов: {r['tokens_prompt'] + r['tokens_completion']}"
+            f"квота: {r['quota']} | запросов: {r['requests']} | токенов: {r['tokens_prompt'] + r['tokens_completion']}"
         )
     text = "\n".join(lines)
     for chunk in split_message(text):
@@ -601,7 +1098,7 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         status = "разрешён" if r["allowed"] else "ожидание"
         if r["blocked"]:
             status = "заблокирован"
-        lines.append(f"• <code>{r['user_id']}</code> | @{html.escape(name)} | {status}")
+        lines.append(f"• <code>{r['user_id']}</code> | @{html.escape(name)} | {status} | квота: {r['quota']}")
     text = "\n".join(lines)
     for chunk in split_message(text):
         await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
@@ -640,47 +1137,68 @@ async def cmd_block(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     set_allowed(uid, 0)
     await update.message.reply_text(f"⛔ Пользователь <code>{uid}</code> заблокирован.", parse_mode=ParseMode.HTML)
 
-# ─── Inline mode ─────────────────────────────────────────────────────────────
-
-async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.inline_query.query
-    user = update.effective_user
-    if not user or not query or len(query.strip()) < 2:
+async def cmd_setquota(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
         return
-
-    ensure_user(user.id, user.username, user.first_name, allowed=1 if user.id == ADMIN_ID else 0)
-
-    if user.id != ADMIN_ID:
-        u = get_user(user.id)
-        if not u or not u["allowed"] or u["blocked"]:
-            if not is_ignored(user.id):
-                await notify_admin_request(update, context)
-            return
-
-    # Делаем запрос к API сразу (инлайн не даёт редактировать потом)
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /setquota &lt;user_id&gt; &lt;n&gt;", parse_mode=ParseMode.HTML)
+        return
     try:
-        result = await ask_gemini(user.id, query.strip(), INLINE_MODEL, with_history=False)
-        formatted = format_gemini_text(result["text"])
-        if len(formatted) > 4000:
-            formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
-    except httpx.HTTPStatusError as e:
-        formatted = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
-    except Exception as e:
-        formatted = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
+        uid = int(context.args[0])
+        quota = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Неверные аргументы.")
+        return
+    set_quota(uid, quota)
+    await update.message.reply_text(f"✅ Квота для <code>{uid}</code> установлена: {quota}", parse_mode=ParseMode.HTML)
 
-    title = query.strip()[:50] + "..." if len(query.strip()) > 50 else query.strip()
-    results = [
-        InlineQueryResultArticle(
-            id="gemini_inline",
-            title=title,
-            input_message_content=InputTextMessageContent(
-                f"<b>Вопрос:</b> {html.escape(query.strip()[:200])}\n\n{formatted}",
-                parse_mode=ParseMode.HTML,
-            ),
-            description="Нажмите, чтобы отправить ответ Gemini",
+async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Использование: /setrate &lt;сообщений&gt; &lt;окно_сек&gt; &lt;игнор_сек&gt;\n"
+            "Пример: <code>/setrate 5 60 600</code> — 5 сообщений в минуту, игнор 10 минут",
+            parse_mode=ParseMode.HTML,
         )
-    ]
-    await update.inline_query.answer(results, cache_time=5, is_personal=True)
+        return
+    try:
+        msgs = int(context.args[0])
+        window = int(context.args[1])
+        ignore = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("Неверные аргументы.")
+        return
+    set_setting("rate_limit_messages", str(msgs))
+    set_setting("rate_limit_window", str(window))
+    set_setting("rate_limit_ignore", str(ignore))
+    await update.message.reply_text(
+        f"✅ Rate limit обновлён:\n"
+        f"• {msgs} сообщений за {window} сек\n"
+        f"• Игнор при превышении: {ignore} сек",
+        parse_mode=ParseMode.HTML,
+    )
+
+# ─── Backup job ──────────────────────────────────────────────────────────────
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        os.makedirs("/app/data/backups", exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        src = "/app/data/bot.db"
+        dst = f"/app/data/backups/bot_{ts}.db"
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+            # keep last 10
+            files = sorted(
+                [f for f in os.listdir("/app/data/backups") if f.startswith("bot_")],
+                key=lambda x: os.path.getmtime(os.path.join("/app/data/backups", x)),
+            )
+            for old in files[:-10]:
+                os.remove(os.path.join("/app/data/backups", old))
+            logger.info(f"Backup created: {dst}")
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
 
 # ─── Error handler ───────────────────────────────────────────────────────────
 
@@ -701,23 +1219,42 @@ def main() -> None:
     init_db()
     application = Application.builder().token(BOT_TOKEN).build()
 
+    # commands
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
+    application.add_handler(CommandHandler("new", cmd_new))
+    application.add_handler(CommandHandler("dialog", cmd_dialogs))
     application.add_handler(CommandHandler("model", cmd_model))
+    application.add_handler(CommandHandler("role", cmd_role))
     application.add_handler(CommandHandler("clear", cmd_clear))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("users", cmd_users))
     application.add_handler(CommandHandler("allow", cmd_allow))
     application.add_handler(CommandHandler("block", cmd_block))
+    application.add_handler(CommandHandler("setquota", cmd_setquota))
+    application.add_handler(CommandHandler("setrate", cmd_setrate))
 
+    # callbacks
     application.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
+    application.add_handler(CallbackQueryHandler(callback_role, pattern=r"^role:"))
+    application.add_handler(CallbackQueryHandler(callback_switch, pattern=r"^switch:"))
     application.add_handler(CallbackQueryHandler(callback_admin, pattern=r"^(allow|ignore):"))
+    application.add_handler(CallbackQueryHandler(callback_actions, pattern=r"^(rephrase|continue|delete):"))
 
+    # inline
     application.add_handler(InlineQueryHandler(inline_query))
+    application.add_handler(ChosenInlineResultHandler(chosen_inline_result))
 
+    # messages
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # errors
     application.add_error_handler(error_handler)
+
+    # backup job at 04:00
+    application.job_queue.run_daily(backup_job, time=datetime.time(hour=4, minute=0))
 
     logger.info("Бот запущен. Ожидаю сообщения...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
