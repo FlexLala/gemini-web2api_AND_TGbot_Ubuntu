@@ -1050,44 +1050,56 @@ async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
     return {"text": answer, "model": INLINE_MODEL}
 
 async def _process_inline_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка inline-результата в отдельной задаче, чтобы не блокировать бота."""
-    chosen = update.chosen_inline_result
-    if not chosen or chosen.result_id != "gemini_inline":
-        return
-    query_text = chosen.query
-    user_id = chosen.from_user.id
-    inline_message_id = chosen.inline_message_id
+    """Обработка inline-результата в отдельной задаче."""
+    try:
+        chosen = update.chosen_inline_result
+        if not chosen or chosen.result_id != "gemini_inline":
+            logger.info("Inline task: invalid result_id or no chosen result")
+            return
+        query_text = chosen.query
+        user_id = chosen.from_user.id
+        inline_message_id = chosen.inline_message_id
 
-    if not inline_message_id:
-        return
+        logger.info(f"Inline task started: user={user_id}, query={query_text[:50]!r}, msg_id={inline_message_id}")
 
-    if user_id != ADMIN_ID:
-        u = get_user(user_id)
-        if not u or not u["allowed"] or u["blocked"]:
+        if not inline_message_id:
+            logger.error("Inline task: no inline_message_id")
             return
 
-    try:
-        result = await ask_gemini_inline(user_id, query_text)
-        formatted = format_gemini_text(result["text"])
-        if len(formatted) > 4000:
-            formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
-    except httpx.HTTPStatusError as e:
-        formatted = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
-    except Exception as e:
-        logger.error(f"Inline processing error: {e}")
-        formatted = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
+        if user_id != ADMIN_ID:
+            u = get_user(user_id)
+            if not u or not u["allowed"] or u["blocked"]:
+                logger.info(f"Inline task: user {user_id} not allowed")
+                return
 
-    try:
-        await context.bot.edit_message_text(
-            text=f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}",
-            inline_message_id=inline_message_id,
-            parse_mode=ParseMode.HTML,
-        )
+        try:
+            result = await ask_gemini_inline(user_id, query_text)
+            formatted = format_gemini_text(result["text"])
+            if len(formatted) > 4000:
+                formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
+            logger.info(f"Inline task: got answer ({len(result['text'])} chars)")
+        except httpx.HTTPStatusError as e:
+            formatted = f"❌ Ошибка API: <code>{e.response.status_code}</code>"
+            logger.error(f"Inline task HTTP error: {e.response.status_code}")
+        except Exception as e:
+            logger.exception("Inline task Gemini error")
+            formatted = f"❌ Ошибка: <code>{html.escape(str(e))}</code>"
+
+        try:
+            await context.bot.edit_message_text(
+                text=f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n{formatted}",
+                inline_message_id=inline_message_id,
+                parse_mode=ParseMode.HTML,
+            )
+            logger.info("Inline task: message edited successfully")
+        except Exception as e:
+            logger.error(f"Inline task edit_message_text failed: {e}")
     except Exception as e:
-        logger.error(f"Edit inline message failed: {e}")
+        logger.exception(f"Inline task unexpected error: {e}")
 
 async def chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Запускаем обработку в фоне, чтобы не блокировать другие апдейты."""
+    logger.info(f"chosen_inline_result received: user={update.chosen_inline_result.from_user.id if update.chosen_inline_result else 'none'}")
     import asyncio
     asyncio.create_task(_process_inline_task(update, context))
 
