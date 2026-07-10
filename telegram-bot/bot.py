@@ -999,6 +999,25 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await _process_text(update, context, prompt, doc_text=doc_text)
 
+async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
+    """Быстрый запрос для inline с коротким таймаутом."""
+    payload = {
+        "model": INLINE_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(GEMINI_API_URL, json=payload, headers=HEADERS)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", "Unknown API error"))
+
+    choice = data.get("choices", [{}])[0]
+    answer = choice.get("message", {}).get("content") or "(пустой ответ)"
+    return {"text": answer, "model": INLINE_MODEL}
+
 # ─── Inline mode (immediate result) ──────────────────────────────────────────
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
