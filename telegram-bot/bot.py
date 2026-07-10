@@ -999,6 +999,42 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await _process_text(update, context, prompt, doc_text=doc_text)
 
+# ─── Inline mode (placeholder + keyboard → chosen_inline_result) ───────────
+
+WAIT_KEYBOARD = InlineKeyboardMarkup([
+    [InlineKeyboardButton(text="⏳ Ответ генерируется…", callback_data="ai_wait")]
+])
+
+async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.inline_query.query
+    user = update.effective_user
+    if not user or not query or len(query.strip()) < 2:
+        return
+
+    ensure_user(user.id, user.username, user.first_name, allowed=1 if user.id == ADMIN_ID else 0)
+
+    if user.id != ADMIN_ID:
+        u = get_user(user.id)
+        if not u or not u["allowed"] or u["blocked"]:
+            if not is_ignored(user.id):
+                await notify_admin_request(update, context)
+            return
+
+    title = query.strip()[:50] + "..." if len(query.strip()) > 50 else query.strip()
+    results = [
+        InlineQueryResultArticle(
+            id="gemini_inline",
+            title=title,
+            input_message_content=InputTextMessageContent(
+                f"⏳ <b>Запрос:</b> {html.escape(query.strip()[:200])}\n\n<i>Обрабатываю…</i>",
+                parse_mode=ParseMode.HTML,
+            ),
+            reply_markup=WAIT_KEYBOARD,
+            description="Нажмите, чтобы отправить запрос",
+        )
+    ]
+    await update.inline_query.answer(results, cache_time=0, is_personal=True)
+
 async def ask_gemini_inline(user_id: int, prompt: str) -> Dict[str, Any]:
     """Быстрый запрос для inline с таймаутом."""
     payload = {
