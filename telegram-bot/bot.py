@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 r"""
-Gemini Telegram Bot v4
-- Переиспользуемый HTTP-клиент с semaphore и retry
-- Безопасное HTML-форматирование (не режет теги)
-- Ограничение истории диалога
-- WAL SQLite с индексами
-- Блокировка на пользователя при concurrent updates
+Gemini Telegram Bot v5
+- Стриминг ответов (live edit)
+- Экспорт диалогов (/export)
+- Graceful shutdown + drain active requests
+- Healthcheck + Circuit Breaker
+- Async backup
+- Telegram API retry wrapper
+- /ping
+- TTS (edge-tts, опционально)
+- Исправлена статистика (HTML не эскейпится дважды)
+- Исправлена обработка фото (логи, размер, try/except)
 """
 
 import os
@@ -14,7 +19,7 @@ import sqlite3
 import html
 import re
 import json
-import time
+import time as _time_module
 import logging
 import shutil
 import base64
@@ -23,7 +28,7 @@ import asyncio
 import hashlib
 import random
 from datetime import datetime, timedelta, time as dt_time
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncGenerator
 
 import httpx
 from telegram import (
@@ -34,7 +39,7 @@ from telegram import (
     InputTextMessageContent,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -45,6 +50,12 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+try:
+    import edge_tts
+    EDGE_TTS_AVAILABLE = True
+except ImportError:
+    EDGE_TTS_AVAILABLE = False
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -95,6 +106,7 @@ GEMINI_INLINE_MAX_TOKENS = max(0, env_int("GEMINI_INLINE_MAX_TOKENS", 1400))
 GEMINI_HISTORY_MESSAGES = max(2, env_int("GEMINI_HISTORY_MESSAGES", 24))
 GEMINI_HISTORY_CHARS = max(2000, env_int("GEMINI_HISTORY_CHARS", 30000))
 TELEGRAM_CONCURRENT_UPDATES = max(1, env_int("TELEGRAM_CONCURRENT_UPDATES", 16))
+STREAMING_ENABLED = env_bool("STREAMING_ENABLED", True)
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +115,94 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# ─── Graceful shutdown helpers ───────────────────────────────────────────────
+
+_active_requests: int = 0
+_request_lock = asyncio.Lock()
+
+async def _increment_active() -> None:
+    global _active_requests
+    async with _request_lock:
+        _active_requests += 1
+
+async def _decrement_active() -> None:
+    global _active_requests
+    async with _request_lock:
+        _active_requests -= 1
+
+async def _wait_active_requests(timeout: float = 60.0) -> bool:
+    deadline = _time_module.monotonic() + timeout
+    while _time_module.monotonic() < deadline:
+        async with _request_lock:
+            if _active_requests <= 0:
+                return True
+        await asyncio.sleep(0.5)
+    logger.warning("Timeout waiting for active requests")
+    return False
+
+# ─── Telegram retry wrappers ─────────────────────────────────────────────────
+
+async def safe_send_message(bot, chat_id, text, parse_mode=None, reply_markup=None, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except (NetworkError, TimedOut):
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.5 ** attempt)
+        except BadRequest:
+            raise
+    return await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+async def safe_edit_message_text(msg, text, parse_mode=None, reply_markup=None, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return await msg.edit_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except (NetworkError, TimedOut):
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.5 ** attempt)
+        except BadRequest:
+            raise
+    return await msg.edit_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+
+async def safe_bot_edit_message_text(bot, text, parse_mode=None, reply_markup=None, inline_message_id=None, chat_id=None, message_id=None, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            return await bot.edit_message_text(
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+                inline_message_id=inline_message_id,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except (NetworkError, TimedOut):
+            if attempt < max_retries - 1:
+                await asyncio.sleep(1.5 ** attempt)
+        except BadRequest:
+            raise
+    return await bot.edit_message_text(
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+        inline_message_id=inline_message_id,
+        chat_id=chat_id,
+        message_id=message_id,
+    )
+
+async def safe_delete_message(msg, max_retries=2):
+    for attempt in range(max_retries):
+        try:
+            return await msg.delete()
+        except Exception:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5)
 
 # ─── Gemini HTTP Client ──────────────────────────────────────────────────────
 
@@ -118,6 +218,34 @@ class GeminiTimeoutError(GeminiRequestError):
 
 class GeminiTransportError(GeminiRequestError):
     pass
+
+class CircuitBreaker:
+    def __init__(self, threshold: int = 5, timeout: float = 30.0):
+        self.threshold = threshold
+        self.timeout = timeout
+        self.failures = 0
+        self.state = "closed"  # closed, open, half-open
+        self.last_failure_time: Optional[float] = None
+
+    def can_execute(self) -> bool:
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if self.last_failure_time and (_time_module.monotonic() - self.last_failure_time) > self.timeout:
+                self.state = "half-open"
+                return True
+            return False
+        return True  # half-open
+
+    def record_success(self) -> None:
+        self.failures = 0
+        self.state = "closed"
+
+    def record_failure(self) -> None:
+        self.failures += 1
+        self.last_failure_time = _time_module.monotonic()
+        if self.failures >= self.threshold:
+            self.state = "open"
 
 class GeminiClient:
     RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -142,6 +270,7 @@ class GeminiClient:
             follow_redirects=True,
             trust_env=False,
         )
+        self._circuit = CircuitBreaker()
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -163,28 +292,40 @@ class GeminiClient:
         await asyncio.sleep(delay)
 
     async def complete(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not self._circuit.can_execute():
+            raise GeminiRequestError("Circuit breaker OPEN: сервер временно недоступен. Попробуйте через минуту.")
+
         for attempt in range(GEMINI_RETRIES + 1):
             try:
                 async with self._semaphore:
                     response = await self._client.post(GEMINI_API_URL, json=payload)
             except httpx.ReadTimeout as exc:
+                self._circuit.record_failure()
                 can_retry = GEMINI_RETRY_READ_TIMEOUT and attempt < GEMINI_RETRIES
                 if can_retry:
                     await self._sleep_before_retry(attempt, "read timeout")
                     continue
                 raise GeminiTimeoutError(f"Gemini не ответил за {GEMINI_READ_TIMEOUT:.0f} секунд") from exc
             except httpx.TransportError as exc:
+                self._circuit.record_failure()
                 if attempt < GEMINI_RETRIES:
                     await self._sleep_before_retry(attempt, type(exc).__name__)
                     continue
                 raise GeminiTransportError("Не удалось подключиться к Gemini API") from exc
 
             if response.status_code in self.RETRYABLE_STATUS_CODES:
+                self._circuit.record_failure()
                 if attempt < GEMINI_RETRIES:
                     await self._sleep_before_retry(attempt, f"HTTP {response.status_code}", response)
                     continue
 
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                self._circuit.record_failure()
+                raise
+
+            self._circuit.record_success()
 
             try:
                 data = response.json()
@@ -204,6 +345,63 @@ class GeminiClient:
 
         raise GeminiRequestError("Неизвестная ошибка Gemini API")
 
+    async def stream_complete(self, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
+        payload = {**payload, "stream": True}
+        if not self._circuit.can_execute():
+            raise GeminiRequestError("Circuit breaker OPEN: сервер временно недоступен. Попробуйте через минуту.")
+
+        for attempt in range(GEMINI_RETRIES + 1):
+            try:
+                async with self._semaphore:
+                    async with self._client.stream("POST", GEMINI_API_URL, json=payload) as response:
+                        if response.status_code in self.RETRYABLE_STATUS_CODES:
+                            self._circuit.record_failure()
+                            if attempt < GEMINI_RETRIES:
+                                await self._sleep_before_retry(attempt, f"HTTP {response.status_code}")
+                                continue
+                            response.raise_for_status()
+
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError:
+                            self._circuit.record_failure()
+                            raise
+
+                        self._circuit.record_success()
+                        async for line in response.aiter_lines():
+                            line = line.strip()
+                            if line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    return
+                                try:
+                                    data = json.loads(data_str)
+                                    delta = data.get("choices", [{}])[0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if content:
+                                        yield content
+                                except json.JSONDecodeError:
+                                    continue
+                return
+            except httpx.ReadTimeout as exc:
+                self._circuit.record_failure()
+                can_retry = GEMINI_RETRY_READ_TIMEOUT and attempt < GEMINI_RETRIES
+                if can_retry:
+                    await self._sleep_before_retry(attempt, "read timeout")
+                    continue
+                raise GeminiTimeoutError(f"Gemini не ответил за {GEMINI_READ_TIMEOUT:.0f} секунд") from exc
+            except httpx.TransportError as exc:
+                self._circuit.record_failure()
+                if attempt < GEMINI_RETRIES:
+                    await self._sleep_before_retry(attempt, type(exc).__name__)
+                    continue
+                raise GeminiTransportError("Не удалось подключиться к Gemini API") from exc
+            except httpx.HTTPStatusError:
+                self._circuit.record_failure()
+                raise
+
+        raise GeminiRequestError("Неизвестная ошибка Gemini API")
+
 gemini_client: Optional[GeminiClient] = None
 
 async def post_init(application: Application) -> None:
@@ -212,6 +410,8 @@ async def post_init(application: Application) -> None:
     logger.info("Gemini HTTP client started: timeout=%ss, concurrency=%s", GEMINI_READ_TIMEOUT, GEMINI_MAX_CONCURRENT)
 
 async def post_shutdown(application: Application) -> None:
+    logger.info("Waiting for active requests to finish...")
+    await _wait_active_requests(timeout=60.0)
     global gemini_client
     if gemini_client is not None:
         await gemini_client.close()
@@ -556,7 +756,7 @@ def get_all_stats() -> List[Dict[str, Any]]:
         for r in rows
     ]
 
-# ─── Rate limit ─────────────────────────────────────────────────────────────-
+# ─── Rate limit ──────────────────────────────────────────────────────────────
 
 def check_rate_limit(user_id: int) -> tuple:
     if user_id == ADMIN_ID:
@@ -564,7 +764,7 @@ def check_rate_limit(user_id: int) -> tuple:
     msgs = int(get_setting("rate_limit_messages", "5"))
     window = int(get_setting("rate_limit_window", "60"))
     ignore_dur = int(get_setting("rate_limit_ignore", "600"))
-    now = time.monotonic()
+    now = _time_module.monotonic()
     conn = _conn()
     c = conn.cursor()
     c.execute("DELETE FROM rate_limit_log WHERE timestamp < ?", (now - window,))
@@ -588,7 +788,7 @@ def is_ignored(user_id: int) -> bool:
     expires_at = _ignore_until.get(user_id)
     if expires_at is None:
         return False
-    if time.monotonic() >= expires_at:
+    if _time_module.monotonic() >= expires_at:
         _ignore_until.pop(user_id, None)
         return False
     return True
@@ -597,7 +797,7 @@ def add_ignore(user_id: int) -> None:
     add_ignore_custom(user_id, IGNORE_TTL_SEC)
 
 def add_ignore_custom(user_id: int, seconds: int) -> None:
-    _ignore_until[user_id] = time.monotonic() + max(1, seconds)
+    _ignore_until[user_id] = _time_module.monotonic() + max(1, seconds)
 
 # ─── LaTeX / HTML formatting ─────────────────────────────────────────────────
 
@@ -619,6 +819,22 @@ def split_plain_text(text: str, max_len: int = 3500) -> List[str]:
         text = text[cut:].lstrip()
     if text:
         chunks.append(text)
+    return chunks
+
+def split_html_lines(lines: List[str], max_len: int = 3500) -> List[str]:
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for line in lines:
+        line_len = len(line)
+        if current_len + line_len + 1 > max_len and current:
+            chunks.append("\n".join(current))
+            current = []
+            current_len = 0
+        current.append(line)
+        current_len += line_len + 1
+    if current:
+        chunks.append("\n".join(current))
     return chunks
 
 def format_gemini_text(raw: str) -> str:
@@ -771,6 +987,10 @@ async def ask_gemini_inline(user_id: int, prompt: str, model: str, system_prompt
     payload = {"model": model, "messages": [], "stream": False}
     if system_prompt:
         payload["messages"].append({"role": "system", "content": system_prompt})
+    else:
+        global_prompt = get_setting("global_inline_prompt", None)
+        if global_prompt:
+            payload["messages"].append({"role": "system", "content": global_prompt})
     payload["messages"].append({"role": "user", "content": prompt})
     if GEMINI_INLINE_MAX_TOKENS > 0:
         payload["max_tokens"] = GEMINI_INLINE_MAX_TOKENS
@@ -837,7 +1057,7 @@ async def notify_admin_request(update: Update, context: ContextTypes.DEFAULT_TYP
          InlineKeyboardButton("🚫 Игнорировать 5 мин", callback_data=f"ignore:{user.id}")],
     ])
     try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await safe_send_message(context.bot, ADMIN_ID, text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Не удалось уведомить админа: {e}")
 
@@ -851,6 +1071,36 @@ def get_user_lock(user_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _user_locks[user_id] = lock
     return lock
+
+# ─── TTS helpers ─────────────────────────────────────────────────────────────
+
+VOICE_ENABLED_KEY = "voice_enabled"
+
+def _detect_voice_lang(text: str) -> str:
+    cyrillic = sum(1 for c in text if '\u0400' <= c <= '\u04ff')
+    return "ru-RU-SvetlanaNeural" if cyrillic > len(text) * 0.3 else "en-US-AriaNeural"
+
+async def _maybe_send_tts(text: str, user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    if not context.user_data.get(VOICE_ENABLED_KEY):
+        return
+    if not EDGE_TTS_AVAILABLE:
+        return
+    if len(text) > 3000:
+        return
+    try:
+        voice = _detect_voice_lang(text)
+        communicate = edge_tts.Communicate(text[:3000], voice)
+        mp3 = io.BytesIO()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                mp3.write(chunk["data"])
+        if mp3.tell() == 0:
+            return
+        mp3.seek(0)
+        mp3.name = "voice.mp3"
+        await context.bot.send_voice(chat_id=chat_id, voice=mp3)
+    except Exception as e:
+        logger.warning("TTS failed for user %s: %s", user_id, e)
 
 # ─── Commands ────────────────────────────────────────────────────────────────
 
@@ -869,6 +1119,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/inlinemodel — модель для инлайна\n"
         "/inlineprompt — промпт для инлайна\n"
         "/clear — очистить активный диалог\n"
+        "/export — экспорт диалога в .md\n"
+        "/voice — голосовые ответы on/off\n"
+        "/ping — пинг API\n"
         "/help — справка\n"
     )
     if user.id == ADMIN_ID:
@@ -880,6 +1133,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/block &lt;id&gt; — заблокировать\n"
             "/setquota &lt;id&gt; &lt;n&gt; — квота\n"
             "/setrate &lt;msg&gt; &lt;win&gt; &lt;ign&gt; — антиспам\n"
+            "/setglobalinlineprompt — глобальный инлайн-промпт\n"
         )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -994,6 +1248,52 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         await update.message.reply_text("Нет активного диалога. Создайте /new")
 
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    user_id = update.effective_user.id
+    dialog = get_active_dialog(user_id)
+    if not dialog:
+        await update.message.reply_text("Нет активного диалога для экспорта.")
+        return
+    history = await asyncio.to_thread(get_dialog_history, dialog["id"], limit=1000)
+    if not history:
+        await update.message.reply_text("Диалог пуст.")
+        return
+    lines = [f"# Диалог #{dialog['id']}: {dialog.get('title', 'Без названия')}\n"]
+    for msg in history:
+        role = "👤 Пользователь" if msg["role"] == "user" else "🤖 Ассистент"
+        lines.append(f"## {role}\n\n{msg['content']}\n")
+    md_text = "\n".join(lines)
+    bio = io.BytesIO(md_text.encode("utf-8"))
+    bio.name = f"dialog_{dialog['id']}.md"
+    await update.message.reply_document(document=bio, caption="📄 Экспорт диалога")
+
+async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_access(update, context):
+        return
+    if not EDGE_TTS_AVAILABLE:
+        await update.message.reply_text("🔊 TTS недоступен: библиотека edge-tts не установлена.")
+        return
+    current = context.user_data.get(VOICE_ENABLED_KEY, False)
+    context.user_data[VOICE_ENABLED_KEY] = not current
+    status = "включено ✅" if not current else "выключено ❌"
+    await update.message.reply_text(f"🔊 Голосовые ответы: {status}")
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    start = _time_module.monotonic()
+    try:
+        await get_gemini_client().complete({
+            "model": INLINE_MODEL,
+            "messages": [{"role": "user", "content": "pong"}],
+            "max_tokens": 1,
+        })
+        api_ms = int((_time_module.monotonic() - start) * 1000)
+        text = f"🏓 <b>Pong!</b>\n\nGemini API: <code>{api_ms} мс</code>"
+    except Exception as e:
+        text = f"🏓 <b>Pong!</b>\n\nGemini API: ❌ <code>{html.escape(str(e)[:200])}</code>"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
 # ─── Callbacks ───────────────────────────────────────────────────────────────
 
 async def callback_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1055,7 +1355,7 @@ async def callback_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         set_blocked(user_id, 0)
         await query.edit_message_text(f"✅ Доступ разрешён для <code>{user_id}</code>", parse_mode=ParseMode.HTML)
         try:
-            await context.bot.send_message(chat_id=user_id, text="🎉 Администратор разрешил вам доступ!")
+            await safe_send_message(context.bot, user_id, "🎉 Администратор разрешил вам доступ!")
         except Exception:
             pass
     elif action == "ignore":
@@ -1080,6 +1380,142 @@ async def callback_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 # ─── Message processing ──────────────────────────────────────────────────────
 
+async def _process_stream_locked(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prompt: str,
+    model: str,
+    dialog_id: Optional[int],
+) -> None:
+    user_id = update.effective_user.id
+    messages = []
+    u = get_user(user_id)
+    final_system = None
+    if u and u.get("custom_prompt"):
+        final_system = u["custom_prompt"]
+    if not final_system and u and u.get("system_role"):
+        role_text = {
+            "programmer": "Ты senior-разработчик. Пиши чистый, современный код с пояснениями.",
+            "translator": "Ты профессиональный переводчик. Переводи точно, сохраняя стиль.",
+            "teacher": "Ты терпеливый учитель. Объясняй сложные вещи простым языком, с примерами.",
+            "concise": "Отвечай максимально кратко и по делу. Без воды.",
+            "creative": "Ты креативный помощник. Предлагай нестандартные идеи.",
+        }.get(u["system_role"], "")
+        if role_text:
+            final_system = role_text
+    if final_system:
+        messages.append({"role": "system", "content": final_system})
+
+    if dialog_id:
+        history = await asyncio.to_thread(get_dialog_history, dialog_id, GEMINI_HISTORY_MESSAGES)
+        messages.extend(trim_dialog_history(history))
+
+    messages.append({"role": "user", "content": prompt})
+
+    payload = {"model": model, "messages": messages, "stream": True}
+    if GEMINI_MAX_TOKENS > 0:
+        payload["max_tokens"] = GEMINI_MAX_TOKENS
+
+    wait_msg = await update.effective_message.reply_text("⏳ Думаю...")
+    buffer = ""
+    last_edit = _time_module.monotonic()
+    edit_errors = 0
+
+    try:
+        await _increment_active()
+        async for chunk in get_gemini_client().stream_complete(payload):
+            buffer += chunk
+            now = _time_module.monotonic()
+            if now - last_edit > 1.2 and buffer:
+                preview = buffer[-3500:]
+                try:
+                    await safe_edit_message_text(
+                        wait_msg,
+                        html.escape(preview) + " ▌",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    last_edit = now
+                    edit_errors = 0
+                except Exception as e:
+                    edit_errors += 1
+                    if edit_errors > 5:
+                        raise
+                    logger.warning("Stream edit error: %s", e)
+
+        await safe_delete_message(wait_msg)
+
+        if dialog_id:
+            await asyncio.to_thread(add_dialog_message, dialog_id, "user", prompt)
+            await asyncio.to_thread(add_dialog_message, dialog_id, "assistant", buffer)
+            pt = max(1, len(json.dumps(messages, ensure_ascii=False)) // 4)
+            ct = max(1, len(buffer) // 4)
+            await asyncio.to_thread(update_dialog_meta, dialog_id, pt + ct)
+            await asyncio.to_thread(update_stats, user_id, pt, ct)
+
+        raw_chunks = split_plain_text(buffer)
+        chunks = [format_gemini_text(chunk) for chunk in raw_chunks]
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Перефразируй", callback_data="rephrase:1"),
+             InlineKeyboardButton("💡 Продолжай", callback_data="continue:1")],
+            [InlineKeyboardButton("❌ Удалить", callback_data="delete:1")],
+        ])
+
+        last_msg = None
+        for i, chunk in enumerate(chunks):
+            try:
+                last_msg = await update.effective_message.reply_text(
+                    chunk,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard if i == len(chunks) - 1 else None,
+                )
+            except BadRequest as exc:
+                logger.warning("Telegram HTML error: %s", exc)
+                last_msg = await update.effective_message.reply_text(
+                    raw_chunks[i],
+                    parse_mode=None,
+                    reply_markup=keyboard if i == len(chunks) - 1 else None,
+                )
+
+        if last_msg:
+            context.user_data["last_bot_message_id"] = last_msg.message_id
+            context.user_data["last_prompt"] = prompt
+
+        if last_msg and len(buffer) <= 3000:
+            await _maybe_send_tts(buffer, user_id, context, update.effective_chat.id)
+
+    except GeminiTimeoutError:
+        logger.warning("Gemini stream timeout: user=%s model=%s", user_id, model)
+        await safe_edit_message_text(
+            wait_msg,
+            f"⌛ <b>Gemini не успел ответить.</b>\n\n"
+            f"Сервер не прислал ответ за {GEMINI_READ_TIMEOUT:.0f} секунд.\n"
+            "Попробуйте ещё раз или выберите более быструю модель.",
+            parse_mode=ParseMode.HTML,
+        )
+    except httpx.HTTPStatusError as exc:
+        logger.error("Gemini HTTP error: status=%s body=%r", exc.response.status_code, exc.response.text[:500])
+        await safe_edit_message_text(
+            wait_msg,
+            f"❌ Ошибка Gemini API: <code>HTTP {exc.response.status_code}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except GeminiRequestError as exc:
+        logger.warning("Gemini stream failed: %s", exc)
+        await safe_edit_message_text(
+            wait_msg,
+            f"❌ Gemini временно недоступен.\n<code>{html.escape(str(exc)[:500])}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Unexpected stream error")
+        await safe_edit_message_text(
+            wait_msg,
+            "❌ Произошла внутренняя ошибка.\nПопробуйте повторить запрос позже.",
+            parse_mode=ParseMode.HTML,
+        )
+    finally:
+        await _decrement_active()
+
 async def _process_text_locked(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1091,6 +1527,13 @@ async def _process_text_locked(
     user = update.effective_user
     user_id = user.id
     model = context.user_data.get("model", DEFAULT_MODEL)
+
+    use_stream = (
+        STREAMING_ENABLED
+        and not image_b64
+        and not doc_text
+        and not edit_msg
+    )
 
     dialog = get_active_dialog(user_id)
     if not dialog:
@@ -1105,6 +1548,10 @@ async def _process_text_locked(
         if cnt == 0 and dialog.get("title") in (None, "", "Новый диалог"):
             update_dialog_title(dialog_id, make_title_from_text(prompt))
 
+    if use_stream:
+        await _process_stream_locked(update, context, prompt, model, dialog_id)
+        return
+
     wait_msg = None
     if edit_msg:
         try:
@@ -1116,6 +1563,7 @@ async def _process_text_locked(
         wait_msg = await update.effective_message.reply_text("⏳ Думаю...")
 
     try:
+        await _increment_active()
         result = await ask_gemini(user_id, prompt, model, dialog_id=dialog_id, image_b64=image_b64, doc_text=doc_text)
     except GeminiTimeoutError:
         logger.warning("Gemini timeout: user=%s model=%s", user_id, model)
@@ -1138,6 +1586,8 @@ async def _process_text_locked(
         logger.exception("Unexpected Gemini error")
         await wait_msg.edit_text("❌ Произошла внутренняя ошибка.\nПопробуйте повторить запрос позже.")
         return
+    finally:
+        await _decrement_active()
 
     raw_chunks = split_plain_text(result["text"])
     chunks = [format_gemini_text(chunk) for chunk in raw_chunks]
@@ -1154,21 +1604,25 @@ async def _process_text_locked(
         [InlineKeyboardButton("❌ Удалить", callback_data="delete:1")],
     ])
 
+    last_msg = None
     for i, chunk in enumerate(chunks):
         try:
-            msg = await update.effective_message.reply_text(
+            last_msg = await update.effective_message.reply_text(
                 chunk, parse_mode=ParseMode.HTML, reply_markup=keyboard if i == len(chunks) - 1 else None
             )
-            if i == len(chunks) - 1:
-                context.user_data["last_bot_message_id"] = msg.message_id
         except BadRequest as exc:
             logger.warning("Telegram HTML error: %s", exc)
-            await update.effective_message.reply_text(
+            last_msg = await update.effective_message.reply_text(
                 raw_chunks[i], parse_mode=None, reply_markup=keyboard if i == len(chunks) - 1 else None
             )
         except Exception as e:
             logger.error(f"Send error: {e}")
             await update.effective_message.reply_text(html.escape(raw_chunks[i]))
+
+    if last_msg:
+        context.user_data["last_bot_message_id"] = last_msg.message_id
+        if len(result["text"]) <= 3000:
+            await _maybe_send_tts(result["text"], user_id, context, update.effective_chat.id)
 
 async def _process_text(
     update: Update,
@@ -1199,10 +1653,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     prompt = update.message.caption or "Опиши эту картинку"
     photo = update.message.photo[-1]
-    file = await photo.get_file()
-    bytes_data = await file.download_as_bytearray()
-    b64 = base64.b64encode(bytes_data).decode()
-    await _process_text(update, context, prompt, image_b64=b64)
+    logger.info("Photo handler: file_id=%s w=%s h=%s", photo.file_id, photo.width, photo.height)
+    try:
+        file = await photo.get_file()
+        bytes_data = await file.download_as_bytearray()
+        logger.info("Photo downloaded: %s bytes", len(bytes_data))
+        if len(bytes_data) == 0:
+            await update.message.reply_text("❌ Не удалось скачать фото (пустой файл).")
+            return
+        b64 = base64.b64encode(bytes_data).decode()
+        if len(b64) > 5_000_000:
+            await update.message.reply_text("❌ Изображение слишком большое для обработки (>~3.7 МБ).")
+            return
+        logger.info("Photo base64 length: %s", len(b64))
+        await _process_text(update, context, prompt, image_b64=b64)
+    except Exception as e:
+        logger.exception("Photo processing failed")
+        await update.message.reply_text(f"❌ Ошибка обработки фото: {html.escape(str(e)[:500])}", parse_mode=ParseMode.HTML)
 
 # ─── Document handler ────────────────────────────────────────────────────────
 
@@ -1343,7 +1810,8 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
 
     if inline_message_id:
         try:
-            await context.bot.edit_message_text(
+            await safe_bot_edit_message_text(
+                context.bot,
                 text=full_text,
                 inline_message_id=inline_message_id,
                 parse_mode=ParseMode.HTML,
@@ -1354,7 +1822,8 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
             logger.error(f"Inline edit failed: {e}")
     else:
         try:
-            await context.bot.send_message(
+            await safe_send_message(
+                context.bot,
                 chat_id=user_id,
                 text=f"📨 <b>Ответ на инлайн-запрос:</b>\n\n{full_text}",
                 parse_mode=ParseMode.HTML,
@@ -1374,7 +1843,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not rows:
         await update.message.reply_text("Нет данных.")
         return
-    lines = ["<b>📊 Статистика</b>\n"]
+    lines = ["<b>📊 Статистика</b>"]
     for r in rows:
         name = r["username"] or r["first_name"] or str(r["user_id"])
         status = "🟢" if r["allowed"] else "🔴"
@@ -1384,24 +1853,22 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{status} <code>{r['user_id']}</code> | @{html.escape(name)} | "
             f"квота: {r['quota']} | запросов: {r['requests']} | токенов: {r['tokens_prompt'] + r['tokens_completion']}"
         )
-    text = "\n".join(lines)
-    for chunk in split_plain_text(text, max_len=3500):
-        await update.message.reply_text(format_gemini_text(chunk), parse_mode=ParseMode.HTML)
+    for chunk in split_html_lines(lines, max_len=3500):
+        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
         return
     rows = get_all_stats()
-    lines = ["<b>👥 Пользователи</b>\n"]
+    lines = ["<b>👥 Пользователи</b>"]
     for r in rows:
         name = r["username"] or r["first_name"] or "—"
         status = "разрешён" if r["allowed"] else "ожидание"
         if r["blocked"]:
             status = "заблокирован"
         lines.append(f"• <code>{r['user_id']}</code> | @{html.escape(name)} | {status} | квота: {r['quota']}")
-    text = "\n".join(lines)
-    for chunk in split_plain_text(text, max_len=3500):
-        await update.message.reply_text(format_gemini_text(chunk), parse_mode=ParseMode.HTML)
+    for chunk in split_html_lines(lines, max_len=3500):
+        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
 async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
@@ -1418,7 +1885,7 @@ async def cmd_allow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     set_blocked(uid, 0)
     await update.message.reply_text(f"✅ Разрешён доступ для <code>{uid}</code>", parse_mode=ParseMode.HTML)
     try:
-        await context.bot.send_message(chat_id=uid, text="🎉 Вам разрешили доступ!")
+        await safe_send_message(context.bot, uid, "🎉 Вам разрешили доступ!")
     except Exception:
         pass
 
@@ -1479,6 +1946,21 @@ async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         parse_mode=ParseMode.HTML,
     )
 
+async def cmd_setglobalinlineprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        current = get_setting("global_inline_prompt", "(не задан)")
+        await update.message.reply_text(
+            f"<b>Глобальный инлайн-промпт:</b>\n<code>{html.escape(current[:500])}</code>\n\n"
+            f"Чтобы изменить: <code>/setglobalinlineprompt Твой промпт...</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    prompt = " ".join(context.args)
+    set_setting("global_inline_prompt", prompt)
+    await update.message.reply_text("✅ Глобальный инлайн-промпт сохранён.")
+
 # ─── Backup job ──────────────────────────────────────────────────────────────
 
 def create_sqlite_backup(destination: str) -> None:
@@ -1506,6 +1988,23 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.info(f"Backup created: {dst}")
     except Exception as e:
         logger.error(f"Backup failed: {e}")
+
+# ─── Healthcheck job ─────────────────────────────────────────────────────────
+
+async def healthcheck_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        client = get_gemini_client()
+        payload = {"model": INLINE_MODEL, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
+        await client.complete(payload)
+        client._circuit.record_success()
+        logger.debug("Healthcheck OK")
+    except Exception as e:
+        logger.warning("Healthcheck failed: %s", e)
+        try:
+            client = get_gemini_client()
+            client._circuit.record_failure()
+        except Exception:
+            pass
 
 # ─── Error handler ───────────────────────────────────────────────────────────
 
@@ -1543,12 +2042,16 @@ def main() -> None:
     application.add_handler(CommandHandler("inlinemodel", cmd_inlinemodel))
     application.add_handler(CommandHandler("inlineprompt", cmd_inlineprompt))
     application.add_handler(CommandHandler("clear", cmd_clear))
+    application.add_handler(CommandHandler("export", cmd_export))
+    application.add_handler(CommandHandler("voice", cmd_voice))
+    application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("users", cmd_users))
     application.add_handler(CommandHandler("allow", cmd_allow))
     application.add_handler(CommandHandler("block", cmd_block))
     application.add_handler(CommandHandler("setquota", cmd_setquota))
     application.add_handler(CommandHandler("setrate", cmd_setrate))
+    application.add_handler(CommandHandler("setglobalinlineprompt", cmd_setglobalinlineprompt))
 
     application.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
     application.add_handler(CallbackQueryHandler(callback_role, pattern=r"^role:"))
@@ -1567,6 +2070,7 @@ def main() -> None:
 
     application.add_error_handler(error_handler)
     application.job_queue.run_daily(backup_job, time=dt_time(hour=4, minute=0))
+    application.job_queue.run_repeating(healthcheck_job, interval=60, first=30)
 
     logger.info("Бот запущен. Ожидаю сообщения...")
     application.run_polling()
