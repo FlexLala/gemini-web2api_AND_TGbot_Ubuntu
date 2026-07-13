@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 r"""
-Gemini Telegram Bot v5
-- Стриминг ответов (live edit)
-- Экспорт диалогов (/export)
-- Graceful shutdown + drain active requests
-- Healthcheck + Circuit Breaker
-- Async backup
-- Telegram API retry wrapper
-- /ping
-- TTS (edge-tts, опционально)
-- Исправлена статистика (HTML не эскейпится дважды)
-- Исправлена обработка фото (логи, размер, try/except)
+Gemini Telegram Bot v6 — Multi-Provider
+Провайдеры (по приоритету):
+  1. Google AI Studio (10 ключей, ротация из /app/data/gemini_keys.txt)
+  2. OpenRouter (free tier, один ключ)
+  3. gemini-web2api (fallback для Pro / когда лимиты)
+  4. DeepSeek API (опционально, если DEEPSEEK_API_KEY задан)
+
+Модель хранится как "provider:model", например "google:gemini-3.5-flash".
 """
 
 import os
@@ -28,7 +25,7 @@ import asyncio
 import hashlib
 import random
 from datetime import datetime, timedelta, time as dt_time
-from typing import Optional, List, Dict, Any, AsyncGenerator
+from typing import Optional, List, Dict, Any, AsyncGenerator, Tuple
 
 import httpx
 from telegram import (
@@ -61,12 +58,22 @@ except ImportError:
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-GEMINI_API_URL = os.getenv("GEMINI_API_URL", "http://gemini-api:8081/v1/chat/completions").strip()
-INLINE_MODEL = os.getenv("INLINE_MODEL", "gemini-3.5-flash").strip()
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-3.5-flash").strip()
-API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+INLINE_MODEL = os.getenv("INLINE_MODEL", "google:gemini-3.5-flash").strip()
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "google:gemini-3.5-flash").strip()
+API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # legacy, не используем
 MAX_DIALOGS = 30
 IGNORE_TTL_SEC = 300
+
+# Provider endpoints
+GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+WEB2API_URL = os.getenv("GEMINI_WEB2API_URL", "http://gemini-api:8081/v1/chat/completions").strip()
+DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
+
+# Keys
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "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").strip()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
+GOOGLE_KEYS_PATH = "/app/data/gemini_keys.txt"
 
 if not BOT_TOKEN:
     raise SystemExit("TELEGRAM_BOT_TOKEN не задан в .env")
@@ -107,6 +114,7 @@ GEMINI_HISTORY_MESSAGES = max(2, env_int("GEMINI_HISTORY_MESSAGES", 24))
 GEMINI_HISTORY_CHARS = max(2000, env_int("GEMINI_HISTORY_CHARS", 30000))
 TELEGRAM_CONCURRENT_UPDATES = max(1, env_int("TELEGRAM_CONCURRENT_UPDATES", 16))
 STREAMING_ENABLED = env_bool("STREAMING_ENABLED", True)
+HEALTHCHECK_TIMEOUT = env_float("HEALTHCHECK_TIMEOUT", 10.0)
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -173,12 +181,8 @@ async def safe_bot_edit_message_text(bot, text, parse_mode=None, reply_markup=No
     for attempt in range(max_retries):
         try:
             return await bot.edit_message_text(
-                text=text,
-                parse_mode=parse_mode,
-                reply_markup=reply_markup,
-                inline_message_id=inline_message_id,
-                chat_id=chat_id,
-                message_id=message_id,
+                text=text, parse_mode=parse_mode, reply_markup=reply_markup,
+                inline_message_id=inline_message_id, chat_id=chat_id, message_id=message_id,
             )
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + 0.5)
@@ -188,12 +192,8 @@ async def safe_bot_edit_message_text(bot, text, parse_mode=None, reply_markup=No
         except BadRequest:
             raise
     return await bot.edit_message_text(
-        text=text,
-        parse_mode=parse_mode,
-        reply_markup=reply_markup,
-        inline_message_id=inline_message_id,
-        chat_id=chat_id,
-        message_id=message_id,
+        text=text, parse_mode=parse_mode, reply_markup=reply_markup,
+        inline_message_id=inline_message_id, chat_id=chat_id, message_id=message_id,
     )
 
 async def safe_delete_message(msg, max_retries=2):
@@ -204,19 +204,81 @@ async def safe_delete_message(msg, max_retries=2):
             if attempt < max_retries - 1:
                 await asyncio.sleep(0.5)
 
-# ─── Gemini HTTP Client ──────────────────────────────────────────────────────
+# ─── Provider config ─────────────────────────────────────────────────────────
 
-HEADERS = {"Content-Type": "application/json"}
-if API_KEY:
-    HEADERS["Authorization"] = f"Bearer {API_KEY}"
+class ProviderConfig:
+    def __init__(self):
+        self.google_keys: List[str] = []
+        self._google_key_index = 0
+        self._google_lock = asyncio.Lock()
+        self._load_google_keys()
 
-class GeminiRequestError(RuntimeError):
+    def _load_google_keys(self) -> None:
+        if os.path.exists(GOOGLE_KEYS_PATH):
+            try:
+                with open(GOOGLE_KEYS_PATH, "r", encoding="utf-8") as f:
+                    self.google_keys = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+                logger.info("Loaded %d Google API keys", len(self.google_keys))
+            except Exception as e:
+                logger.error("Failed to load Google keys: %s", e)
+        else:
+            logger.info("No %s found, Google AI Studio disabled", GOOGLE_KEYS_PATH)
+
+    def reload_google_keys(self) -> None:
+        self._load_google_keys()
+
+    async def get_next_google_key(self) -> Optional[str]:
+        async with self._google_lock:
+            if not self.google_keys:
+                return None
+            key = self.google_keys[self._google_key_index]
+            self._google_key_index = (self._google_key_index + 1) % len(self.google_keys)
+            return key
+
+    def is_provider_available(self, provider: str) -> bool:
+        if provider == "google":
+            return len(self.google_keys) > 0
+        if provider == "openrouter":
+            return bool(OPENROUTER_API_KEY)
+        if provider == "web2api":
+            return True
+        if provider == "deepseek":
+            return bool(DEEPSEEK_API_KEY)
+        return False
+
+    def get_headers(self, provider: str, key: Optional[str] = None) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if provider == "google" and key:
+            headers["Authorization"] = f"Bearer {key}"
+        elif provider == "openrouter" and OPENROUTER_API_KEY:
+            headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
+            headers["HTTP-Referer"] = "https://t.me/"
+            headers["X-Title"] = "GeminiTelegramBot"
+        elif provider == "deepseek" and DEEPSEEK_API_KEY:
+            headers["Authorization"] = f"Bearer {DEEPSEEK_API_KEY}"
+        elif provider == "web2api" and API_KEY:
+            headers["Authorization"] = f"Bearer {API_KEY}"
+        return headers
+
+    def get_url(self, provider: str) -> str:
+        return {
+            "google": GOOGLE_API_URL,
+            "openrouter": OPENROUTER_API_URL,
+            "web2api": WEB2API_URL,
+            "deepseek": DEEPSEEK_API_URL,
+        }.get(provider, WEB2API_URL)
+
+provider_config = ProviderConfig()
+
+# ─── Multi-Provider HTTP Client ──────────────────────────────────────────────
+
+class ProviderError(RuntimeError):
     pass
 
-class GeminiTimeoutError(GeminiRequestError):
+class ProviderTimeoutError(ProviderError):
     pass
 
-class GeminiTransportError(GeminiRequestError):
+class ProviderTransportError(ProviderError):
     pass
 
 class CircuitBreaker:
@@ -224,7 +286,7 @@ class CircuitBreaker:
         self.threshold = threshold
         self.timeout = timeout
         self.failures = 0
-        self.state = "closed"  # closed, open, half-open
+        self.state = "closed"
         self.last_failure_time: Optional[float] = None
 
     def can_execute(self) -> bool:
@@ -235,7 +297,7 @@ class CircuitBreaker:
                 self.state = "half-open"
                 return True
             return False
-        return True  # half-open
+        return True
 
     def record_success(self) -> None:
         self.failures = 0
@@ -247,7 +309,7 @@ class CircuitBreaker:
         if self.failures >= self.threshold:
             self.state = "open"
 
-class GeminiClient:
+class MultiProviderClient:
     RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
     def __init__(self) -> None:
@@ -264,13 +326,13 @@ class GeminiClient:
         )
         self._semaphore = asyncio.Semaphore(GEMINI_MAX_CONCURRENT)
         self._client = httpx.AsyncClient(
-            headers=HEADERS,
             timeout=timeout,
             limits=limits,
             follow_redirects=True,
             trust_env=False,
         )
         self._circuit = CircuitBreaker()
+        self._google_key_exhausted: set = set()  # keys that returned 429 recently
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -288,35 +350,60 @@ class GeminiClient:
 
     async def _sleep_before_retry(self, attempt: int, reason: str, response: Optional[httpx.Response] = None) -> None:
         delay = self._retry_delay(attempt, response)
-        logger.warning("Gemini retry %s/%s in %.1f sec: %s", attempt + 1, GEMINI_RETRIES, delay, reason)
+        logger.warning("Retry %s/%s in %.1f sec: %s", attempt + 1, GEMINI_RETRIES, delay, reason)
         await asyncio.sleep(delay)
 
-    async def complete(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _extract_answer(self, data: Dict[str, Any]) -> str:
+        choices = data.get("choices", [])
+        if not choices:
+            return "(пустой ответ)"
+        choice = choices[0]
+        message = choice.get("message", {}) or {}
+        content = message.get("content")
+        if content:
+            return str(content)
+        reasoning = message.get("reasoning_content")
+        if reasoning:
+            return str(reasoning)
+        for key in ("text", "delta", "body"):
+            val = message.get(key)
+            if val:
+                if isinstance(val, dict):
+                    val = val.get("content") or val.get("text")
+                if val:
+                    return str(val)
+        return "(пустой ответ)"
+
+    async def _request(self, provider: str, payload: Dict[str, Any], key: Optional[str] = None) -> Dict[str, Any]:
         if not self._circuit.can_execute():
-            raise GeminiRequestError("Circuit breaker OPEN: сервер временно недоступен. Попробуйте через минуту.")
+            raise ProviderError("Circuit breaker OPEN: сервер временно недоступен. Попробуйте через минуту.")
+
+        url = provider_config.get_url(provider)
+        headers = provider_config.get_headers(provider, key)
+        start = _time_module.monotonic()
 
         for attempt in range(GEMINI_RETRIES + 1):
             try:
                 async with self._semaphore:
-                    response = await self._client.post(GEMINI_API_URL, json=payload)
+                    response = await self._client.post(url, json=payload, headers=headers)
             except httpx.ReadTimeout as exc:
                 self._circuit.record_failure()
                 can_retry = GEMINI_RETRY_READ_TIMEOUT and attempt < GEMINI_RETRIES
                 if can_retry:
-                    await self._sleep_before_retry(attempt, "read timeout")
+                    await self._sleep_before_retry(attempt, f"{provider} read timeout")
                     continue
-                raise GeminiTimeoutError(f"Gemini не ответил за {GEMINI_READ_TIMEOUT:.0f} секунд") from exc
+                raise ProviderTimeoutError(f"{provider} не ответил за {GEMINI_READ_TIMEOUT:.0f} секунд") from exc
             except httpx.TransportError as exc:
                 self._circuit.record_failure()
                 if attempt < GEMINI_RETRIES:
-                    await self._sleep_before_retry(attempt, type(exc).__name__)
+                    await self._sleep_before_retry(attempt, f"{provider} {type(exc).__name__}")
                     continue
-                raise GeminiTransportError("Не удалось подключиться к Gemini API") from exc
+                raise ProviderTransportError(f"Не удалось подключиться к {provider}") from exc
 
             if response.status_code in self.RETRYABLE_STATUS_CODES:
                 self._circuit.record_failure()
                 if attempt < GEMINI_RETRIES:
-                    await self._sleep_before_retry(attempt, f"HTTP {response.status_code}", response)
+                    await self._sleep_before_retry(attempt, f"{provider} HTTP {response.status_code}", response)
                     continue
 
             try:
@@ -331,33 +418,36 @@ class GeminiClient:
                 data = response.json()
             except ValueError as exc:
                 body = response.text[:500]
-                raise GeminiRequestError(f"Gemini вернул не JSON: {body}") from exc
+                raise ProviderError(f"{provider} вернул не JSON: {body}") from exc
 
             api_error = data.get("error")
             if api_error:
-                if isinstance(api_error, dict):
-                    message = api_error.get("message") or str(api_error)
-                else:
-                    message = str(api_error)
-                raise GeminiRequestError(message)
+                msg = api_error.get("message") if isinstance(api_error, dict) else str(api_error)
+                raise ProviderError(f"{provider} error: {msg}")
 
+            latency_ms = int((_time_module.monotonic() - start) * 1000)
+            logger.info("%s complete: latency=%dms model=%s", provider, latency_ms, payload.get("model", "?"))
             return data
 
-        raise GeminiRequestError("Неизвестная ошибка Gemini API")
+        raise ProviderError(f"{provider}: неизвестная ошибка")
 
-    async def stream_complete(self, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
+    async def _stream_request(self, provider: str, payload: Dict[str, Any], key: Optional[str] = None) -> AsyncGenerator[str, None]:
         payload = {**payload, "stream": True}
         if not self._circuit.can_execute():
-            raise GeminiRequestError("Circuit breaker OPEN: сервер временно недоступен. Попробуйте через минуту.")
+            raise ProviderError("Circuit breaker OPEN")
+
+        url = provider_config.get_url(provider)
+        headers = provider_config.get_headers(provider, key)
+        start = _time_module.monotonic()
 
         for attempt in range(GEMINI_RETRIES + 1):
             try:
                 async with self._semaphore:
-                    async with self._client.stream("POST", GEMINI_API_URL, json=payload) as response:
+                    async with self._client.stream("POST", url, json=payload, headers=headers) as response:
                         if response.status_code in self.RETRYABLE_STATUS_CODES:
                             self._circuit.record_failure()
                             if attempt < GEMINI_RETRIES:
-                                await self._sleep_before_retry(attempt, f"HTTP {response.status_code}")
+                                await self._sleep_before_retry(attempt, f"{provider} HTTP {response.status_code}")
                                 continue
                             response.raise_for_status()
 
@@ -373,55 +463,214 @@ class GeminiClient:
                             if line.startswith("data: "):
                                 data_str = line[6:]
                                 if data_str == "[DONE]":
+                                    latency_ms = int((_time_module.monotonic() - start) * 1000)
+                                    logger.info("%s stream: latency=%dms model=%s", provider, latency_ms, payload.get("model", "?"))
                                     return
                                 try:
                                     data = json.loads(data_str)
-                                    delta = data.get("choices", [{}])[0].get("delta", {})
+                                    choices = data.get("choices", [])
+                                    if not choices:
+                                        continue
+                                    delta = choices[0].get("delta", {}) or {}
                                     content = delta.get("content", "")
                                     if content:
-                                        yield content
+                                        yield str(content)
                                 except json.JSONDecodeError:
                                     continue
-                return
+                        latency_ms = int((_time_module.monotonic() - start) * 1000)
+                        logger.info("%s stream: latency=%dms model=%s", provider, latency_ms, payload.get("model", "?"))
+                        return
             except httpx.ReadTimeout as exc:
                 self._circuit.record_failure()
                 can_retry = GEMINI_RETRY_READ_TIMEOUT and attempt < GEMINI_RETRIES
                 if can_retry:
-                    await self._sleep_before_retry(attempt, "read timeout")
+                    await self._sleep_before_retry(attempt, f"{provider} read timeout")
                     continue
-                raise GeminiTimeoutError(f"Gemini не ответил за {GEMINI_READ_TIMEOUT:.0f} секунд") from exc
+                raise ProviderTimeoutError(f"{provider} не ответил за {GEMINI_READ_TIMEOUT:.0f} секунд") from exc
             except httpx.TransportError as exc:
                 self._circuit.record_failure()
                 if attempt < GEMINI_RETRIES:
-                    await self._sleep_before_retry(attempt, type(exc).__name__)
+                    await self._sleep_before_retry(attempt, f"{provider} {type(exc).__name__}")
                     continue
-                raise GeminiTransportError("Не удалось подключиться к Gemini API") from exc
+                raise ProviderTransportError(f"Не удалось подключиться к {provider}") from exc
             except httpx.HTTPStatusError:
                 self._circuit.record_failure()
                 raise
 
-        raise GeminiRequestError("Неизвестная ошибка Gemini API")
+        raise ProviderError(f"{provider}: неизвестная ошибка")
 
-gemini_client: Optional[GeminiClient] = None
+    async def complete(self, provider: str, model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Делает запрос к провайдеру с fallback-цепочкой."""
+        payload = {**payload, "model": model}
+        errors: List[str] = []
+
+        # 1. Пробуем основной провайдер
+        if provider == "google":
+            # Ротация ключей Google
+            for _ in range(max(1, len(provider_config.google_keys))):
+                key = await provider_config.get_next_google_key()
+                if not key:
+                    break
+                try:
+                    return await self._request("google", payload, key=key)
+                except (ProviderTimeoutError, ProviderTransportError, httpx.HTTPStatusError) as exc:
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                        logger.warning("Google key rate limited, rotating...")
+                        continue
+                    errors.append(f"Google: {exc}")
+                    break
+                except ProviderError as exc:
+                    errors.append(f"Google: {exc}")
+                    break
+        else:
+            if provider_config.is_provider_available(provider):
+                try:
+                    return await self._request(provider, payload)
+                except Exception as exc:
+                    errors.append(f"{provider}: {exc}")
+
+        # 2. Fallback на OpenRouter (если модель есть там)
+        or_model = _map_to_openrouter(model)
+        if or_model and provider_config.is_provider_available("openrouter"):
+            try:
+                fb_payload = {**payload, "model": or_model}
+                return await self._request("openrouter", fb_payload)
+            except Exception as exc:
+                errors.append(f"OpenRouter: {exc}")
+
+        # 3. Fallback на web2api
+        w2_model = _map_to_web2api(model)
+        if w2_model and provider_config.is_provider_available("web2api"):
+            try:
+                fb_payload = {**payload, "model": w2_model}
+                return await self._request("web2api", fb_payload)
+            except Exception as exc:
+                errors.append(f"web2api: {exc}")
+
+        raise ProviderError(f"Все провайдеры недоступны. Ошибки: {'; '.join(errors[:3])}")
+
+    async def stream_complete(self, provider: str, model: str, payload: Dict[str, Any]) -> AsyncGenerator[str, None]:
+        payload = {**payload, "model": model}
+
+        if provider == "google":
+            for _ in range(max(1, len(provider_config.google_keys))):
+                key = await provider_config.get_next_google_key()
+                if not key:
+                    break
+                try:
+                    async for chunk in self._stream_request("google", payload, key=key):
+                        yield chunk
+                    return
+                except (ProviderTimeoutError, ProviderTransportError, httpx.HTTPStatusError) as exc:
+                    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 429:
+                        logger.warning("Google key rate limited, rotating...")
+                        continue
+                    raise
+        else:
+            if provider_config.is_provider_available(provider):
+                async for chunk in self._stream_request(provider, payload):
+                    yield chunk
+                return
+
+        # Fallback на OpenRouter
+        or_model = _map_to_openrouter(model)
+        if or_model and provider_config.is_provider_available("openrouter"):
+            fb_payload = {**payload, "model": or_model}
+            async for chunk in self._stream_request("openrouter", fb_payload):
+                yield chunk
+            return
+
+        # Fallback на web2api
+        w2_model = _map_to_web2api(model)
+        if w2_model and provider_config.is_provider_available("web2api"):
+            fb_payload = {**payload, "model": w2_model}
+            async for chunk in self._stream_request("web2api", fb_payload):
+                yield chunk
+            return
+
+        raise ProviderError("Стриминг недоступен ни у одного провайдера")
+
+    async def healthcheck(self, provider: str) -> Tuple[bool, int]:
+        url = provider_config.get_url(provider)
+        headers = provider_config.get_headers(provider)
+        if provider == "google":
+            key = await provider_config.get_next_google_key()
+            if not key:
+                return False, 0
+            headers = provider_config.get_headers("google", key)
+
+        start = _time_module.monotonic()
+        try:
+            hc_timeout = httpx.Timeout(connect=5.0, read=HEALTHCHECK_TIMEOUT, write=5.0, pool=5.0)
+            async with httpx.AsyncClient(timeout=hc_timeout, follow_redirects=True, trust_env=False) as client:
+                resp = await client.post(
+                    url,
+                    headers=headers,
+                    json={"model": "gemini-3.5-flash" if provider == "google" else "google/gemini-3.5-flash",
+                          "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+                )
+                ms = int((_time_module.monotonic() - start) * 1000)
+                if resp.status_code == 200:
+                    self._circuit.record_success()
+                    return True, ms
+                else:
+                    self._circuit.record_failure()
+                    return False, ms
+        except Exception as exc:
+            ms = int((_time_module.monotonic() - start) * 1000)
+            logger.debug("Healthcheck %s failed: %s", provider, exc)
+            self._circuit.record_failure()
+            return False, ms
+
+mp_client: Optional[MultiProviderClient] = None
 
 async def post_init(application: Application) -> None:
-    global gemini_client
-    gemini_client = GeminiClient()
-    logger.info("Gemini HTTP client started: timeout=%ss, concurrency=%s", GEMINI_READ_TIMEOUT, GEMINI_MAX_CONCURRENT)
+    global mp_client
+    mp_client = MultiProviderClient()
+    logger.info("Multi-provider client started")
 
 async def post_shutdown(application: Application) -> None:
     logger.info("Waiting for active requests to finish...")
     await _wait_active_requests(timeout=60.0)
-    global gemini_client
-    if gemini_client is not None:
-        await gemini_client.close()
-        gemini_client = None
-    logger.info("Gemini HTTP client stopped")
+    global mp_client
+    if mp_client is not None:
+        await mp_client.close()
+        mp_client = None
+    logger.info("Multi-provider client stopped")
 
-def get_gemini_client() -> GeminiClient:
-    if gemini_client is None:
-        raise RuntimeError("Gemini HTTP client is not initialized")
-    return gemini_client
+def get_mp_client() -> MultiProviderClient:
+    if mp_client is None:
+        raise RuntimeError("MultiProviderClient not initialized")
+    return mp_client
+
+# ─── Model mapping helpers ───────────────────────────────────────────────────
+
+def _map_to_openrouter(model: str) -> Optional[str]:
+    mapping = {
+        "gemini-3.5-flash": "google/gemini-3.5-flash",
+        "gemini-3.1-flash-lite": "google/gemini-3.1-flash-lite",
+        "gemini-2.5-pro": "google/gemini-2.5-pro",
+        "deepseek-v4-flash": "deepseek/deepseek-chat",
+        "deepseek-v4-pro": "deepseek/deepseek-chat",
+        "deepseek-chat": "deepseek/deepseek-chat",
+    }
+    return mapping.get(model)
+
+def _map_to_web2api(model: str) -> Optional[str]:
+    mapping = {
+        "gemini-3.5-flash": "gemini-3.5-flash",
+        "gemini-3.1-flash-lite": "gemini-flash-lite",
+        "gemini-2.5-pro": "gemini-3.1-pro",
+        "gemini-3.1-pro": "gemini-3.1-pro",
+    }
+    return mapping.get(model)
+
+def _parse_model_slug(slug: str) -> Tuple[str, str]:
+    if ":" in slug:
+        provider, model = slug.split(":", 1)
+        return provider, model
+    # Legacy fallback
+    return "web2api", slug
 
 # ─── Database ────────────────────────────────────────────────────────────────
 
@@ -848,36 +1097,27 @@ def format_gemini_text(raw: str) -> str:
         replacements.append(value)
         return token
 
-    # ```code blocks```
     def replace_code_block(match: re.Match) -> str:
         code = match.group(2) or ""
         return stash(f"<pre><code>{html.escape(code.strip())}</code></pre>")
     text = re.sub(r"```(?:([A-Za-z0-9_+.\-]+)\n)?(.*?)```", replace_code_block, text, flags=re.DOTALL)
 
-    # \[...\] и $$...$$
     def replace_display_math(match: re.Match) -> str:
         value = match.group(1) if match.group(1) is not None else match.group(2)
         return stash(f"<pre>{html.escape((value or '').strip())}</pre>")
     text = re.sub(r"\\\[(.*?)\\\]|\$\$(.*?)\$\$", replace_display_math, text, flags=re.DOTALL)
 
-    # \(...\) и $...$
     def replace_inline_math(match: re.Match) -> str:
         value = match.group(1) if match.group(1) is not None else match.group(2)
         return stash(f"<code>{html.escape((value or '').strip())}</code>")
     text = re.sub(r"\\\((.*?)\\\)|(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)", replace_inline_math, text, flags=re.DOTALL)
 
-    # `inline code`
     text = re.sub(r"`([^`\n]+)`", lambda m: stash(f"<code>{html.escape(m.group(1))}</code>"), text)
 
-    # Экранируем обычный текст
     formatted = html.escape(text)
-
-    # Заголовки
     formatted = re.sub(r"(?m)^#{1,6}[ \t]+(.+)$", r"<b>\1</b>", formatted)
-    # **bold**
     formatted = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", formatted)
 
-    # Возвращаем безопасные HTML-фрагменты
     for index, replacement in enumerate(replacements):
         formatted = formatted.replace(f"\uE000{index}\uE001", replacement)
 
@@ -914,17 +1154,19 @@ def trim_dialog_history(messages: List[Dict[str, Any]], max_chars: int = GEMINI_
     result.reverse()
     return result
 
-# ─── Gemini API ──────────────────────────────────────────────────────────────
+# ─── API helpers ─────────────────────────────────────────────────────────────
 
-async def ask_gemini(
+async def ask_ai(
     user_id: int,
     prompt: str,
-    model: str,
+    model_slug: str,
     dialog_id: Optional[int] = None,
     image_b64: Optional[str] = None,
     doc_text: Optional[str] = None,
     system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
+    provider, model = _parse_model_slug(model_slug)
+
     messages = []
     u = get_user(user_id)
     final_system = system_prompt
@@ -958,13 +1200,13 @@ async def ask_gemini(
         ]
     messages.append({"role": "user", "content": content})
 
-    payload = {"model": model, "messages": messages, "stream": False}
+    payload = {"messages": messages, "stream": False}
     if GEMINI_MAX_TOKENS > 0:
         payload["max_tokens"] = GEMINI_MAX_TOKENS
 
-    data = await get_gemini_client().complete(payload)
-    choice = data.get("choices", [{}])[0]
-    answer = choice.get("message", {}).get("content") or "(пустой ответ)"
+    client = get_mp_client()
+    data = await client.complete(provider, model, payload)
+    answer = client._extract_answer(data)
 
     if dialog_id:
         add_dialog_message(dialog_id, "user", prompt if not doc_text else f"{prompt} [+документ]")
@@ -981,10 +1223,11 @@ async def ask_gemini(
         ct = max(1, len(answer) // 4)
     await asyncio.to_thread(update_stats, user_id, pt, ct)
 
-    return {"text": answer, "model": model}
+    return {"text": answer, "model": model, "provider": provider}
 
-async def ask_gemini_inline(user_id: int, prompt: str, model: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
-    payload = {"model": model, "messages": [], "stream": False}
+async def ask_ai_inline(user_id: int, prompt: str, model_slug: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
+    provider, model = _parse_model_slug(model_slug)
+    payload = {"messages": [], "stream": False}
     if system_prompt:
         payload["messages"].append({"role": "system", "content": system_prompt})
     else:
@@ -995,11 +1238,11 @@ async def ask_gemini_inline(user_id: int, prompt: str, model: str, system_prompt
     if GEMINI_INLINE_MAX_TOKENS > 0:
         payload["max_tokens"] = GEMINI_INLINE_MAX_TOKENS
 
-    data = await get_gemini_client().complete(payload)
-    choice = data.get("choices", [{}])[0]
-    answer = choice.get("message", {}).get("content") or "(пустой ответ)"
+    client = get_mp_client()
+    data = await client.complete(provider, model, payload)
+    answer = client._extract_answer(data)
     usage = data.get("usage", {})
-    return {"text": answer, "model": model, "usage": usage}
+    return {"text": answer, "model": model, "provider": provider, "usage": usage}
 
 # ─── Access control ──────────────────────────────────────────────────────────
 
@@ -1109,11 +1352,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ensure_user(user.id, user.username, user.first_name, allowed=1 if user.id == ADMIN_ID else 0)
     text = (
         "👋 <b>Привет!</b>\n\n"
-        "Я бот для Gemini через локальный API (Германия -> Gemini).\n\n"
+        "Я мульти-провайдерный AI-бот.\n\n"
         "<b>Команды:</b>\n"
         "/new — новый диалог\n"
         "/dialog — мои диалоги\n"
-        "/model — выбрать модель\n"
+        "/model — выбрать модель и провайдера\n"
         "/role — выбрать роль\n"
         "/prompt — свой системный промпт\n"
         "/inlinemodel — модель для инлайна\n"
@@ -1121,7 +1364,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/clear — очистить активный диалог\n"
         "/export — экспорт диалога в .md\n"
         "/voice — голосовые ответы on/off\n"
-        "/ping — пинг API\n"
+        "/ping — пинг провайдеров\n"
+        "/providers — статус провайдеров\n"
         "/help — справка\n"
     )
     if user.id == ADMIN_ID:
@@ -1134,6 +1378,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/setquota &lt;id&gt; &lt;n&gt; — квота\n"
             "/setrate &lt;msg&gt; &lt;win&gt; &lt;ign&gt; — антиспам\n"
             "/setglobalinlineprompt — глобальный инлайн-промпт\n"
+            "/reloadkeys — перечитать gemini_keys.txt\n"
         )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -1162,18 +1407,31 @@ async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         buttons.append([InlineKeyboardButton(f"#{d['id']} {d['title'][:30]}", callback_data=f"switch:{d['id']}")])
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
 
+# ─── Model selection ─────────────────────────────────────────────────────────
+
+MODEL_BUTTONS = [
+    [InlineKeyboardButton("⚡ Gemini 3.5 Flash (Google)", callback_data="model:google:gemini-3.5-flash")],
+    [InlineKeyboardButton("🪶 Gemini 3.1 Flash Lite (Google)", callback_data="model:google:gemini-3.1-flash-lite")],
+    [InlineKeyboardButton("🧠 Gemini 2.5 Pro (Google)", callback_data="model:google:gemini-2.5-pro")],
+    [InlineKeyboardButton("🌐 Gemini 3.5 Flash (OpenRouter)", callback_data="model:openrouter:google/gemini-3.5-flash")],
+    [InlineKeyboardButton("🌐 DeepSeek Chat (OpenRouter)", callback_data="model:openrouter:deepseek/deepseek-chat")],
+    [InlineKeyboardButton("🌐 Claude Sonnet (OpenRouter)", callback_data="model:openrouter:anthropic/claude-sonnet-4")],
+    [InlineKeyboardButton("🔧 Gemini 3.5 Flash (web2api)", callback_data="model:web2api:gemini-3.5-flash")],
+    [InlineKeyboardButton("🔧 Gemini 3.1 Pro (web2api)", callback_data="model:web2api:gemini-3.1-pro")],
+    [InlineKeyboardButton("🔧 Gemini Flash Thinking (web2api)", callback_data="model:web2api:gemini-3.5-flash-thinking")],
+]
+
+# DeepSeek optional
+if DEEPSEEK_API_KEY:
+    MODEL_BUTTONS.extend([
+        [InlineKeyboardButton("🔥 DeepSeek V4 Flash", callback_data="model:deepseek:deepseek-v4-flash")],
+        [InlineKeyboardButton("🔥 DeepSeek V4 Pro", callback_data="model:deepseek:deepseek-v4-pro")],
+    ])
+
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
         return
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ Gemini 3.5 Flash", callback_data="model:gemini-3.5-flash")],
-        [InlineKeyboardButton("🧠 Flash Thinking", callback_data="model:gemini-3.5-flash-thinking")],
-        [InlineKeyboardButton("🔬 Gemini 3.1 Pro", callback_data="model:gemini-3.1-pro")],
-        [InlineKeyboardButton("🎯 Gemini Auto", callback_data="model:gemini-auto")],
-        [InlineKeyboardButton("💡 Flash Thinking Lite", callback_data="model:gemini-3.5-flash-thinking-lite")],
-        [InlineKeyboardButton("🪶 Flash Lite", callback_data="model:gemini-flash-lite")],
-    ])
-    await update.message.reply_text("Выберите модель:", reply_markup=keyboard)
+    await update.message.reply_text("Выберите модель:", reply_markup=InlineKeyboardMarkup(MODEL_BUTTONS))
 
 async def cmd_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
@@ -1207,15 +1465,13 @@ async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_inlinemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
         return
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ Flash", callback_data="inlinemodel:gemini-3.5-flash")],
-        [InlineKeyboardButton("🧠 Flash Thinking", callback_data="inlinemodel:gemini-3.5-flash-thinking")],
-        [InlineKeyboardButton("🔬 Pro", callback_data="inlinemodel:gemini-3.1-pro")],
-        [InlineKeyboardButton("🎯 Auto", callback_data="inlinemodel:gemini-auto")],
-        [InlineKeyboardButton("💡 Flash Thinking Lite", callback_data="inlinemodel:gemini-3.5-flash-thinking-lite")],
-        [InlineKeyboardButton("🪶 Flash Lite", callback_data="inlinemodel:gemini-flash-lite")],
-    ])
-    await update.message.reply_text("Выберите модель для инлайн-режима:", reply_markup=keyboard)
+    # Inline uses same buttons but prefixed with inlinemodel:
+    inline_buttons = []
+    for row in MODEL_BUTTONS:
+        btn = row[0]
+        new_data = btn.callback_data.replace("model:", "inlinemodel:")
+        inline_buttons.append([InlineKeyboardButton(btn.text, callback_data=new_data)])
+    await update.message.reply_text("Выберите модель для инлайн-режима:", reply_markup=InlineKeyboardMarkup(inline_buttons))
 
 async def cmd_inlineprompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
@@ -1281,18 +1537,40 @@ async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"🔊 Голосовые ответы: {status}")
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    start = _time_module.monotonic()
-    try:
-        await get_gemini_client().complete({
-            "model": INLINE_MODEL,
-            "messages": [{"role": "user", "content": "pong"}],
-            "max_tokens": 1,
-        })
-        api_ms = int((_time_module.monotonic() - start) * 1000)
-        text = f"🏓 <b>Pong!</b>\n\nGemini API: <code>{api_ms} мс</code>"
-    except Exception as e:
-        text = f"🏓 <b>Pong!</b>\n\nGemini API: ❌ <code>{html.escape(str(e)[:200])}</code>"
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    lines = ["🏓 <b>Ping провайдеров</b>"]
+    client = get_mp_client()
+    for provider in ("google", "openrouter", "web2api"):
+        if not provider_config.is_provider_available(provider):
+            lines.append(f"• {provider}: <i>не настроен</i>")
+            continue
+        try:
+            ok, ms = await client.healthcheck(provider)
+            icon = "✅" if ok else "❌"
+            lines.append(f"• {provider}: <code>{ms} мс</code> {icon}")
+        except Exception as e:
+            lines.append(f"• {provider}: ❌ <code>{html.escape(str(e)[:100])}</code>")
+    if DEEPSEEK_API_KEY:
+        try:
+            ok, ms = await client.healthcheck("deepseek")
+            icon = "✅" if ok else "❌"
+            lines.append(f"• deepseek: <code>{ms} мс</code> {icon}")
+        except Exception as e:
+            lines.append(f"• deepseek: ❌ <code>{html.escape(str(e)[:100])}</code>")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = ["<b>📡 Провайдеры</b>"]
+    lines.append(f"• Google AI Studio: <code>{len(provider_config.google_keys)}</code> ключей")
+    lines.append(f"• OpenRouter: {'✅' if OPENROUTER_API_KEY else '❌'}")
+    lines.append(f"• web2api: <code>{WEB2API_URL}</code>")
+    lines.append(f"• DeepSeek: {'✅' if DEEPSEEK_API_KEY else '❌ (добавь DEEPSEEK_API_KEY в .env)'}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+async def cmd_reloadkeys(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        return
+    provider_config.reload_google_keys()
+    await update.message.reply_text(f"🔄 Перечитано <code>{len(provider_config.google_keys)}</code> Google-ключей.", parse_mode=ParseMode.HTML)
 
 # ─── Callbacks ───────────────────────────────────────────────────────────────
 
@@ -1301,9 +1579,26 @@ async def callback_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     data = query.data
     if data.startswith("model:"):
-        model = data.split(":", 1)[1]
-        context.user_data["model"] = model
-        await query.edit_message_text(f"✅ Модель: <code>{html.escape(model)}</code>", parse_mode=ParseMode.HTML)
+        slug = data[len("model:"):]
+        context.user_data["model"] = slug
+        provider, model = _parse_model_slug(slug)
+        await query.edit_message_text(
+            f"✅ Модель: <code>{html.escape(model)}</code>\nПровайдер: <code>{provider}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+async def callback_inlinemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("inlinemodel:"):
+        slug = data[len("inlinemodel:"):]
+        set_inline_model(update.effective_user.id, slug)
+        provider, model = _parse_model_slug(slug)
+        await query.edit_message_text(
+            f"✅ Инлайн-модель: <code>{html.escape(model)}</code>\nПровайдер: <code>{provider}</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
 async def callback_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1315,15 +1610,6 @@ async def callback_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         set_custom_prompt(update.effective_user.id, None)
         name = {"programmer": "💻 Программист", "translator": "🌐 Переводчик", "teacher": "📚 Учитель", "concise": "✂️ Кратко", "creative": "🎨 Креатив"}.get(role, "🔄 Обычный")
         await query.edit_message_text(f"✅ Роль: {name}", parse_mode=ParseMode.HTML)
-
-async def callback_inlinemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data.startswith("inlinemodel:"):
-        model = data.split(":", 1)[1]
-        set_inline_model(update.effective_user.id, model)
-        await query.edit_message_text(f"✅ Инлайн-модель: <code>{html.escape(model)}</code>", parse_mode=ParseMode.HTML)
 
 async def callback_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1384,10 +1670,12 @@ async def _process_stream_locked(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     prompt: str,
-    model: str,
+    model_slug: str,
     dialog_id: Optional[int],
 ) -> None:
     user_id = update.effective_user.id
+    provider, model = _parse_model_slug(model_slug)
+
     messages = []
     u = get_user(user_id)
     final_system = None
@@ -1412,7 +1700,7 @@ async def _process_stream_locked(
 
     messages.append({"role": "user", "content": prompt})
 
-    payload = {"model": model, "messages": messages, "stream": True}
+    payload = {"messages": messages, "stream": True}
     if GEMINI_MAX_TOKENS > 0:
         payload["max_tokens"] = GEMINI_MAX_TOKENS
 
@@ -1423,7 +1711,7 @@ async def _process_stream_locked(
 
     try:
         await _increment_active()
-        async for chunk in get_gemini_client().stream_complete(payload):
+        async for chunk in get_mp_client().stream_complete(provider, model, payload):
             buffer += chunk
             now = _time_module.monotonic()
             if now - last_edit > 1.2 and buffer:
@@ -1443,6 +1731,10 @@ async def _process_stream_locked(
                     logger.warning("Stream edit error: %s", e)
 
         await safe_delete_message(wait_msg)
+
+        if not buffer.strip():
+            await update.effective_message.reply_text("(пустой ответ)")
+            return
 
         if dialog_id:
             await asyncio.to_thread(add_dialog_message, dialog_id, "user", prompt)
@@ -1483,27 +1775,27 @@ async def _process_stream_locked(
         if last_msg and len(buffer) <= 3000:
             await _maybe_send_tts(buffer, user_id, context, update.effective_chat.id)
 
-    except GeminiTimeoutError:
-        logger.warning("Gemini stream timeout: user=%s model=%s", user_id, model)
+    except ProviderTimeoutError:
+        logger.warning("Stream timeout: user=%s model=%s", user_id, model_slug)
         await safe_edit_message_text(
             wait_msg,
-            f"⌛ <b>Gemini не успел ответить.</b>\n\n"
+            f"⌛ <b>Провайдер не успел ответить.</b>\n\n"
             f"Сервер не прислал ответ за {GEMINI_READ_TIMEOUT:.0f} секунд.\n"
-            "Попробуйте ещё раз или выберите более быструю модель.",
+            "Попробуйте ещё раз или выберите другую модель.",
             parse_mode=ParseMode.HTML,
         )
     except httpx.HTTPStatusError as exc:
-        logger.error("Gemini HTTP error: status=%s body=%r", exc.response.status_code, exc.response.text[:500])
+        logger.error("HTTP error: status=%s body=%r", exc.response.status_code, exc.response.text[:500])
         await safe_edit_message_text(
             wait_msg,
-            f"❌ Ошибка Gemini API: <code>HTTP {exc.response.status_code}</code>",
+            f"❌ Ошибка API: <code>HTTP {exc.response.status_code}</code>",
             parse_mode=ParseMode.HTML,
         )
-    except GeminiRequestError as exc:
-        logger.warning("Gemini stream failed: %s", exc)
+    except ProviderError as exc:
+        logger.warning("Stream failed: %s", exc)
         await safe_edit_message_text(
             wait_msg,
-            f"❌ Gemini временно недоступен.\n<code>{html.escape(str(exc)[:500])}</code>",
+            f"❌ Провайдер временно недоступен.\n<code>{html.escape(str(exc)[:500])}</code>",
             parse_mode=ParseMode.HTML,
         )
     except Exception:
@@ -1526,7 +1818,7 @@ async def _process_text_locked(
 ) -> None:
     user = update.effective_user
     user_id = user.id
-    model = context.user_data.get("model", DEFAULT_MODEL)
+    model_slug = context.user_data.get("model", DEFAULT_MODEL)
 
     use_stream = (
         STREAMING_ENABLED
@@ -1549,7 +1841,7 @@ async def _process_text_locked(
             update_dialog_title(dialog_id, make_title_from_text(prompt))
 
     if use_stream:
-        await _process_stream_locked(update, context, prompt, model, dialog_id)
+        await _process_stream_locked(update, context, prompt, model_slug, dialog_id)
         return
 
     wait_msg = None
@@ -1564,26 +1856,26 @@ async def _process_text_locked(
 
     try:
         await _increment_active()
-        result = await ask_gemini(user_id, prompt, model, dialog_id=dialog_id, image_b64=image_b64, doc_text=doc_text)
-    except GeminiTimeoutError:
-        logger.warning("Gemini timeout: user=%s model=%s", user_id, model)
+        result = await ask_ai(user_id, prompt, model_slug, dialog_id=dialog_id, image_b64=image_b64, doc_text=doc_text)
+    except ProviderTimeoutError:
+        logger.warning("Timeout: user=%s model=%s", user_id, model_slug)
         await wait_msg.edit_text(
-            f"⌛ <b>Gemini не успел ответить.</b>\n\n"
+            f"⌛ <b>Провайдер не успел ответить.</b>\n\n"
             f"Сервер не прислал ответ за {GEMINI_READ_TIMEOUT:.0f} секунд.\n"
-            "Попробуйте ещё раз или выберите более быструю модель.",
+            "Попробуйте ещё раз или выберите другую модель.",
             parse_mode=ParseMode.HTML,
         )
         return
     except httpx.HTTPStatusError as exc:
-        logger.error("Gemini HTTP error: status=%s body=%r", exc.response.status_code, exc.response.text[:500])
-        await wait_msg.edit_text(f"❌ Ошибка Gemini API: <code>HTTP {exc.response.status_code}</code>", parse_mode=ParseMode.HTML)
+        logger.error("HTTP error: status=%s body=%r", exc.response.status_code, exc.response.text[:500])
+        await wait_msg.edit_text(f"❌ Ошибка API: <code>HTTP {exc.response.status_code}</code>", parse_mode=ParseMode.HTML)
         return
-    except GeminiRequestError as exc:
-        logger.warning("Gemini request failed: %s", exc)
-        await wait_msg.edit_text(f"❌ Gemini временно недоступен.\n<code>{html.escape(str(exc)[:500])}</code>", parse_mode=ParseMode.HTML)
+    except ProviderError as exc:
+        logger.warning("Request failed: %s", exc)
+        await wait_msg.edit_text(f"❌ Провайдер временно недоступен.\n<code>{html.escape(str(exc)[:500])}</code>", parse_mode=ParseMode.HTML)
         return
     except Exception:
-        logger.exception("Unexpected Gemini error")
+        logger.exception("Unexpected error")
         await wait_msg.edit_text("❌ Произошла внутренняя ошибка.\nПопробуйте повторить запрос позже.")
         return
     finally:
@@ -1782,7 +2074,7 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
     inline_prompt = u.get("inline_prompt") if u else None
 
     try:
-        result = await ask_gemini_inline(user_id, query_text, inline_model, system_prompt=inline_prompt)
+        result = await ask_ai_inline(user_id, query_text, inline_model, system_prompt=inline_prompt)
         formatted = format_gemini_text(result["text"])
         if len(formatted) > 4000:
             formatted = formatted[:3990] + "\n\n<i>...обрезано</i>"
@@ -1795,17 +2087,17 @@ async def _process_inline_chosen(update: Update, context: ContextTypes.DEFAULT_T
         if ct is None:
             ct = max(1, len(result["text"]) // 4)
         await asyncio.to_thread(update_stats, user_id, pt, ct)
-    except GeminiTimeoutError:
-        logger.warning("Inline Gemini timeout: user=%s model=%s", user_id, inline_model)
-        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n⌛ Gemini не успел ответить. Попробуйте ещё раз или выберите более быструю модель."
+    except ProviderTimeoutError:
+        logger.warning("Inline timeout: user=%s model=%s", user_id, inline_model)
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n⌛ Провайдер не успел ответить. Попробуйте ещё раз или выберите другую модель."
     except httpx.HTTPStatusError as exc:
-        logger.error("Inline Gemini HTTP error: %s %r", exc.response.status_code, exc.response.text[:500])
-        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка Gemini API: <code>HTTP {exc.response.status_code}</code>"
-    except GeminiRequestError as exc:
-        logger.warning("Inline Gemini error: %s", exc)
-        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Gemini временно недоступен."
+        logger.error("Inline HTTP error: %s %r", exc.response.status_code, exc.response.text[:500])
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Ошибка API: <code>HTTP {exc.response.status_code}</code>"
+    except ProviderError as exc:
+        logger.warning("Inline error: %s", exc)
+        full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Провайдер временно недоступен."
     except Exception:
-        logger.exception("Unexpected inline Gemini error")
+        logger.exception("Unexpected inline error")
         full_text = f"<b>Вопрос:</b> {html.escape(query_text[:200])}\n\n❌ Произошла внутренняя ошибка."
 
     if inline_message_id:
@@ -1992,19 +2284,18 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ─── Healthcheck job ─────────────────────────────────────────────────────────
 
 async def healthcheck_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        client = get_gemini_client()
-        payload = {"model": INLINE_MODEL, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}
-        await client.complete(payload)
-        client._circuit.record_success()
-        logger.debug("Healthcheck OK")
-    except Exception as e:
-        logger.warning("Healthcheck failed: %s", e)
+    client = get_mp_client()
+    for provider in ("google", "openrouter", "web2api"):
+        if not provider_config.is_provider_available(provider):
+            continue
         try:
-            client = get_gemini_client()
-            client._circuit.record_failure()
-        except Exception:
-            pass
+            ok, ms = await client.healthcheck(provider)
+            if ok:
+                logger.debug("Healthcheck %s OK (%d ms)", provider, ms)
+            else:
+                logger.warning("Healthcheck %s failed (HTTP non-200, %d ms)", provider, ms)
+        except Exception as exc:
+            logger.warning("Healthcheck %s exception: %s", provider, exc)
 
 # ─── Error handler ───────────────────────────────────────────────────────────
 
@@ -2045,6 +2336,7 @@ def main() -> None:
     application.add_handler(CommandHandler("export", cmd_export))
     application.add_handler(CommandHandler("voice", cmd_voice))
     application.add_handler(CommandHandler("ping", cmd_ping))
+    application.add_handler(CommandHandler("providers", cmd_providers))
     application.add_handler(CommandHandler("stats", cmd_stats))
     application.add_handler(CommandHandler("users", cmd_users))
     application.add_handler(CommandHandler("allow", cmd_allow))
@@ -2052,10 +2344,11 @@ def main() -> None:
     application.add_handler(CommandHandler("setquota", cmd_setquota))
     application.add_handler(CommandHandler("setrate", cmd_setrate))
     application.add_handler(CommandHandler("setglobalinlineprompt", cmd_setglobalinlineprompt))
+    application.add_handler(CommandHandler("reloadkeys", cmd_reloadkeys))
 
     application.add_handler(CallbackQueryHandler(callback_model, pattern=r"^model:"))
-    application.add_handler(CallbackQueryHandler(callback_role, pattern=r"^role:"))
     application.add_handler(CallbackQueryHandler(callback_inlinemodel, pattern=r"^inlinemodel:"))
+    application.add_handler(CallbackQueryHandler(callback_role, pattern=r"^role:"))
     application.add_handler(CallbackQueryHandler(callback_switch, pattern=r"^switch:"))
     application.add_handler(CallbackQueryHandler(callback_admin, pattern=r"^(allow|ignore):"))
     application.add_handler(CallbackQueryHandler(callback_actions, pattern=r"^(rephrase|continue|delete):"))
