@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 r"""
-Gemini Telegram Bot v6 — Multi-Provider
+Gemini Telegram Bot v6.1 — Multi-Provider + Groq
 Провайдеры (по приоритету):
-  1. Google AI Studio (10 ключей, ротация из /app/data/gemini_keys.txt)
-  2. OpenRouter (free tier, один ключ)
-  3. gemini-web2api (fallback для Pro / когда лимиты)
-  4. DeepSeek API (опционально, если DEEPSEEK_API_KEY задан)
+  1. Google AI Studio (ключи из /app/data/gemini_keys.txt, ротация)
+  2. Groq (14,400 req/day, без карты, быстрый)
+  3. OpenRouter (free tier)
+  4. gemini-web2api (fallback для Pro)
+  5. DeepSeek API (опционально)
 
-Модель хранится как "provider:model", например "google:gemini-3.5-flash".
+Healthcheck: раз в час, не жрёт квоту.
 """
 
 import os
@@ -58,19 +59,20 @@ except ImportError:
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-INLINE_MODEL = os.getenv("INLINE_MODEL", "google:gemini-3.5-flash").strip()
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "google:gemini-3.5-flash").strip()
-API_KEY = os.getenv("GEMINI_API_KEY", "").strip()  # legacy, не используем
+INLINE_MODEL = os.getenv("INLINE_MODEL", "groq:llama-3.3-70b-versatile").strip()
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "groq:llama-3.3-70b-versatile").strip()
 MAX_DIALOGS = 30
 IGNORE_TTL_SEC = 300
 
 # Provider endpoints
 GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 WEB2API_URL = os.getenv("GEMINI_WEB2API_URL", "http://gemini-api:8081/v1/chat/completions").strip()
 DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 # Keys
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "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").strip()
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 GOOGLE_KEYS_PATH = "/app/data/gemini_keys.txt"
@@ -238,6 +240,8 @@ class ProviderConfig:
     def is_provider_available(self, provider: str) -> bool:
         if provider == "google":
             return len(self.google_keys) > 0
+        if provider == "groq":
+            return bool(GROQ_API_KEY)
         if provider == "openrouter":
             return bool(OPENROUTER_API_KEY)
         if provider == "web2api":
@@ -250,19 +254,20 @@ class ProviderConfig:
         headers = {"Content-Type": "application/json"}
         if provider == "google" and key:
             headers["Authorization"] = f"Bearer {key}"
+        elif provider == "groq" and GROQ_API_KEY:
+            headers["Authorization"] = f"Bearer {GROQ_API_KEY}"
         elif provider == "openrouter" and OPENROUTER_API_KEY:
             headers["Authorization"] = f"Bearer {OPENROUTER_API_KEY}"
             headers["HTTP-Referer"] = "https://t.me/"
             headers["X-Title"] = "GeminiTelegramBot"
         elif provider == "deepseek" and DEEPSEEK_API_KEY:
             headers["Authorization"] = f"Bearer {DEEPSEEK_API_KEY}"
-        elif provider == "web2api" and API_KEY:
-            headers["Authorization"] = f"Bearer {API_KEY}"
         return headers
 
     def get_url(self, provider: str) -> str:
         return {
             "google": GOOGLE_API_URL,
+            "groq": GROQ_API_URL,
             "openrouter": OPENROUTER_API_URL,
             "web2api": WEB2API_URL,
             "deepseek": DEEPSEEK_API_URL,
@@ -332,7 +337,6 @@ class MultiProviderClient:
             trust_env=False,
         )
         self._circuit = CircuitBreaker()
-        self._google_key_exhausted: set = set()  # keys that returned 429 recently
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -500,13 +504,10 @@ class MultiProviderClient:
         raise ProviderError(f"{provider}: неизвестная ошибка")
 
     async def complete(self, provider: str, model: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Делает запрос к провайдеру с fallback-цепочкой."""
         payload = {**payload, "model": model}
         errors: List[str] = []
 
-        # 1. Пробуем основной провайдер
         if provider == "google":
-            # Ротация ключей Google
             for _ in range(max(1, len(provider_config.google_keys))):
                 key = await provider_config.get_next_google_key()
                 if not key:
@@ -529,23 +530,15 @@ class MultiProviderClient:
                 except Exception as exc:
                     errors.append(f"{provider}: {exc}")
 
-        # 2. Fallback на OpenRouter (если модель есть там)
-        or_model = _map_to_openrouter(model)
-        if or_model and provider_config.is_provider_available("openrouter"):
+        # Fallback chain
+        for fb_provider, fb_model in self._fallback_chain(provider, model):
+            if not provider_config.is_provider_available(fb_provider):
+                continue
             try:
-                fb_payload = {**payload, "model": or_model}
-                return await self._request("openrouter", fb_payload)
+                fb_payload = {**payload, "model": fb_model}
+                return await self._request(fb_provider, fb_payload)
             except Exception as exc:
-                errors.append(f"OpenRouter: {exc}")
-
-        # 3. Fallback на web2api
-        w2_model = _map_to_web2api(model)
-        if w2_model and provider_config.is_provider_available("web2api"):
-            try:
-                fb_payload = {**payload, "model": w2_model}
-                return await self._request("web2api", fb_payload)
-            except Exception as exc:
-                errors.append(f"web2api: {exc}")
+                errors.append(f"{fb_provider}: {exc}")
 
         raise ProviderError(f"Все провайдеры недоступны. Ошибки: {'; '.join(errors[:3])}")
 
@@ -572,23 +565,32 @@ class MultiProviderClient:
                     yield chunk
                 return
 
-        # Fallback на OpenRouter
-        or_model = _map_to_openrouter(model)
-        if or_model and provider_config.is_provider_available("openrouter"):
-            fb_payload = {**payload, "model": or_model}
-            async for chunk in self._stream_request("openrouter", fb_payload):
-                yield chunk
-            return
-
-        # Fallback на web2api
-        w2_model = _map_to_web2api(model)
-        if w2_model and provider_config.is_provider_available("web2api"):
-            fb_payload = {**payload, "model": w2_model}
-            async for chunk in self._stream_request("web2api", fb_payload):
+        for fb_provider, fb_model in self._fallback_chain(provider, model):
+            if not provider_config.is_provider_available(fb_provider):
+                continue
+            fb_payload = {**payload, "model": fb_model}
+            async for chunk in self._stream_request(fb_provider, fb_payload):
                 yield chunk
             return
 
         raise ProviderError("Стриминг недоступен ни у одного провайдера")
+
+    def _fallback_chain(self, provider: str, model: str) -> List[Tuple[str, str]]:
+        """Возвращает fallback-провайдеров в порядке приоритета."""
+        chain: List[Tuple[str, str]] = []
+        # 1. Groq
+        groq_model = _map_to_groq(model)
+        if groq_model and provider != "groq":
+            chain.append(("groq", groq_model))
+        # 2. OpenRouter
+        or_model = _map_to_openrouter(model)
+        if or_model and provider != "openrouter":
+            chain.append(("openrouter", or_model))
+        # 3. web2api
+        w2_model = _map_to_web2api(model)
+        if w2_model and provider != "web2api":
+            chain.append(("web2api", w2_model))
+        return chain
 
     async def healthcheck(self, provider: str) -> Tuple[bool, int]:
         url = provider_config.get_url(provider)
@@ -599,6 +601,13 @@ class MultiProviderClient:
                 return False, 0
             headers = provider_config.get_headers("google", key)
 
+        # Для Google и Groq используем HEAD или очень лёгкий запрос
+        test_model = "gemini-3.5-flash" if provider == "google" else (
+            "llama-3.3-70b-versatile" if provider == "groq" else (
+                "google/gemini-3.5-flash" if provider == "openrouter" else "gemini-3.5-flash"
+            )
+        )
+
         start = _time_module.monotonic()
         try:
             hc_timeout = httpx.Timeout(connect=5.0, read=HEALTHCHECK_TIMEOUT, write=5.0, pool=5.0)
@@ -606,8 +615,7 @@ class MultiProviderClient:
                 resp = await client.post(
                     url,
                     headers=headers,
-                    json={"model": "gemini-3.5-flash" if provider == "google" else "google/gemini-3.5-flash",
-                          "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+                    json={"model": test_model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
                 )
                 ms = int((_time_module.monotonic() - start) * 1000)
                 if resp.status_code == 200:
@@ -645,11 +653,26 @@ def get_mp_client() -> MultiProviderClient:
 
 # ─── Model mapping helpers ───────────────────────────────────────────────────
 
+def _map_to_groq(model: str) -> Optional[str]:
+    mapping = {
+        "gemini-3.5-flash": "llama-3.3-70b-versatile",
+        "gemini-3.1-flash-lite": "llama-3.1-8b-instant",
+        "gemini-2.5-pro": "llama-3.3-70b-versatile",
+        "deepseek-v4-flash": "deepseek-r1-distill-llama-70b",
+        "deepseek-v4-pro": "deepseek-r1-distill-llama-70b",
+        "deepseek-chat": "deepseek-r1-distill-llama-70b",
+        "google/gemini-3.5-flash": "llama-3.3-70b-versatile",
+        "google/gemini-3.1-flash-lite": "llama-3.1-8b-instant",
+        "deepseek/deepseek-chat": "deepseek-r1-distill-llama-70b",
+    }
+    return mapping.get(model)
+
 def _map_to_openrouter(model: str) -> Optional[str]:
     mapping = {
         "gemini-3.5-flash": "google/gemini-3.5-flash",
         "gemini-3.1-flash-lite": "google/gemini-3.1-flash-lite",
         "gemini-2.5-pro": "google/gemini-2.5-pro",
+        "llama-3.3-70b-versatile": "meta-llama/llama-3.3-70b-instruct",
         "deepseek-v4-flash": "deepseek/deepseek-chat",
         "deepseek-v4-pro": "deepseek/deepseek-chat",
         "deepseek-chat": "deepseek/deepseek-chat",
@@ -662,6 +685,7 @@ def _map_to_web2api(model: str) -> Optional[str]:
         "gemini-3.1-flash-lite": "gemini-flash-lite",
         "gemini-2.5-pro": "gemini-3.1-pro",
         "gemini-3.1-pro": "gemini-3.1-pro",
+        "llama-3.3-70b-versatile": None,
     }
     return mapping.get(model)
 
@@ -669,7 +693,6 @@ def _parse_model_slug(slug: str) -> Tuple[str, str]:
     if ":" in slug:
         provider, model = slug.split(":", 1)
         return provider, model
-    # Legacy fallback
     return "web2api", slug
 
 # ─── Database ────────────────────────────────────────────────────────────────
@@ -1410,6 +1433,9 @@ async def cmd_dialogs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # ─── Model selection ─────────────────────────────────────────────────────────
 
 MODEL_BUTTONS = [
+    [InlineKeyboardButton("🚀 Llama 3.3 70B (Groq)", callback_data="model:groq:llama-3.3-70b-versatile")],
+    [InlineKeyboardButton("🚀 Llama 3.1 8B (Groq)", callback_data="model:groq:llama-3.1-8b-instant")],
+    [InlineKeyboardButton("🚀 DeepSeek R1 Distill (Groq)", callback_data="model:groq:deepseek-r1-distill-llama-70b")],
     [InlineKeyboardButton("⚡ Gemini 3.5 Flash (Google)", callback_data="model:google:gemini-3.5-flash")],
     [InlineKeyboardButton("🪶 Gemini 3.1 Flash Lite (Google)", callback_data="model:google:gemini-3.1-flash-lite")],
     [InlineKeyboardButton("🧠 Gemini 2.5 Pro (Google)", callback_data="model:google:gemini-2.5-pro")],
@@ -1418,10 +1444,8 @@ MODEL_BUTTONS = [
     [InlineKeyboardButton("🌐 Claude Sonnet (OpenRouter)", callback_data="model:openrouter:anthropic/claude-sonnet-4")],
     [InlineKeyboardButton("🔧 Gemini 3.5 Flash (web2api)", callback_data="model:web2api:gemini-3.5-flash")],
     [InlineKeyboardButton("🔧 Gemini 3.1 Pro (web2api)", callback_data="model:web2api:gemini-3.1-pro")],
-    [InlineKeyboardButton("🔧 Gemini Flash Thinking (web2api)", callback_data="model:web2api:gemini-3.5-flash-thinking")],
 ]
 
-# DeepSeek optional
 if DEEPSEEK_API_KEY:
     MODEL_BUTTONS.extend([
         [InlineKeyboardButton("🔥 DeepSeek V4 Flash", callback_data="model:deepseek:deepseek-v4-flash")],
@@ -1465,7 +1489,6 @@ async def cmd_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_inlinemodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_access(update, context):
         return
-    # Inline uses same buttons but prefixed with inlinemodel:
     inline_buttons = []
     for row in MODEL_BUTTONS:
         btn = row[0]
@@ -1539,9 +1562,8 @@ async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["🏓 <b>Ping провайдеров</b>"]
     client = get_mp_client()
-    for provider in ("google", "openrouter", "web2api"):
+    for provider in ("groq", "google", "openrouter", "web2api"):
         if not provider_config.is_provider_available(provider):
-            lines.append(f"• {provider}: <i>не настроен</i>")
             continue
         try:
             ok, ms = await client.healthcheck(provider)
@@ -1560,6 +1582,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_providers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["<b>📡 Провайдеры</b>"]
+    lines.append(f"• Groq: {'✅' if GROQ_API_KEY else '❌ (добавь GROQ_API_KEY в .env)'}")
     lines.append(f"• Google AI Studio: <code>{len(provider_config.google_keys)}</code> ключей")
     lines.append(f"• OpenRouter: {'✅' if OPENROUTER_API_KEY else '❌'}")
     lines.append(f"• web2api: <code>{WEB2API_URL}</code>")
@@ -2285,7 +2308,7 @@ async def backup_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def healthcheck_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     client = get_mp_client()
-    for provider in ("google", "openrouter", "web2api"):
+    for provider in ("groq", "google", "openrouter", "web2api"):
         if not provider_config.is_provider_available(provider):
             continue
         try:
@@ -2363,7 +2386,7 @@ def main() -> None:
 
     application.add_error_handler(error_handler)
     application.job_queue.run_daily(backup_job, time=dt_time(hour=4, minute=0))
-    application.job_queue.run_repeating(healthcheck_job, interval=60, first=30)
+    application.job_queue.run_repeating(healthcheck_job, interval=3600, first=300)  # раз в час!
 
     logger.info("Бот запущен. Ожидаю сообщения...")
     application.run_polling()
